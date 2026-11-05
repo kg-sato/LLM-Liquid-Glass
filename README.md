@@ -62,6 +62,32 @@ python tools/llm_hud_send.py `
   --summary "All hooks verified in explorer.exe and IDE processes. Type below to send a follow-up."
 ```
 
+### 3. Automatic Triggering After Every Antigravity / Claude Code Turn (`Stop` Hook)
+Why doesn't Windows automatically know when an LLM finishes a turn? Because Electron/IDE agents (like Antigravity and Cursor) do not emit legacy Win32 `Shell_NotifyIconW` tray balloons when you are actively looking at the window. Instead, Antigravity and Claude Code provide a native **`Stop` lifecycle hook** that fires the exact millisecond an agent finishes its turn (`NO_TOOL_CALL`) and passes the conversation transcript path on `stdin`.
+
+We included [`tools/agy_stop_hook.py`](./tools/agy_stop_hook.py), which automatically reads the last assistant message from the transcript, extracts any numbered/lettered options (or falls back to Summary Mode), and triggers the Liquid Glass HUD.
+
+Add this to your `hooks.json` (e.g. `~/.gemini/antigravity/hooks/hooks.json` or `.gemini/hooks/hooks.json`):
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"C:/Users/kgsat/.gemini/antigravity/scratch/windhawk-llm-glass-hud/tools/agy_stop_hook.py\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
 ---
 
 ## ⚙️ Mod Settings (Configurable in Windhawk UI)
@@ -74,6 +100,7 @@ python tools/llm_hud_send.py `
 | `autoDismissSeconds` | `18` | Seconds before auto-dismissing (`0` = stay until answered or swiped away) |
 | `enableHotkeys` | `true` | Enables global `Alt+1` .. `Alt+4` hotkeys while the HUD is visible |
 | `interceptToasts` | `true` | Automatically hooks `Shell_NotifyIconW` & `FlashWindowEx` in Antigravity, Cursor, VS Code, Claude, and Windows Terminal |
+| `showDemoOnStartup` | `true` | Immediately pops up a welcome Liquid Glass HUD when the mod loads or settings are saved in Windhawk |
 
 ---
 

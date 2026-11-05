@@ -2,7 +2,7 @@
 // @id              llm-liquid-glass-hud
 // @name            LLM Liquid Glass HUD (Apple Spotlight & Dynamic Notification)
 // @description     Apple Liquid Glass floating HUD near the taskbar that pops up when an LLM finishes a cycle, displays interactive multiple-choice options or summary text, and lets you reply/select without leaving your active window.
-// @version         1.3.0
+// @version         1.4.0
 // @author          kg-sato
 // @github          https://github.com/kg-sato/LLM-Liquid-Glass
 // @include         explorer.exe
@@ -27,16 +27,10 @@ An Apple-inspired **Liquid Glass floating HUD** positioned near the bottom taskb
   - When an LLM provides a long option or multi-sentence description, the button automatically displays the concise **subtitle/heading** (e.g., before `:` or `—`, or a smartly truncated label) with a subtle `⋯` indicator.
   - Hovering any truncated option pill or long summary description springs open an **origin-aware Apple Liquid Glass Popover** above the HUD showing the full multi-line text.
   - Supports Emil Kowalski's **instant neighbour tooltip rule**: once the hover popover is open, moving across adjacent options updates and repositions it immediately with zero re-entry delay.
-- **High-Precision 120Hz Spring Physics & Gesture Dismissal**:
-  - Uses `QueryPerformanceCounter` (QPC) delta-time integration at up to 120fps (`8ms` frame step) so motion stays locked to display velocity with zero frame-time drift.
-  - Multi-property coupled springs: position (`ySpring`), true matrix scale (`scaleSpring` anchored at bottom-center `transform-origin`), height morph (`heightSpring`), opacity (`opacitySpring`), per-pill hover/press springs (`pillScale[4]`, `pillHover[4]`), and popover spring (`popoverSpring`).
-  - 4-sample ring-buffer velocity tracker during 1:1 pointer-captured drag, progressive rubber-banding (`c = 0.55`), and Apple exponential decay momentum projection (`decelerationRate = 0.994`) with velocity handoff.
-  - Respects Windows `SPI_GETCLIENTAREAANIMATION` (`prefers-reduced-motion`).
-- **Security & Privacy Hardened (`cybersecurity-skills` Verified)**:
-  - **IAM / Least-Privilege Named Pipe DACL**: Pipe is locked exclusively to the current logon user SID (`TOKEN_USER`) + `PIPE_REJECT_REMOTE_CLIENTS`.
-  - **Confused-Deputy Target Window Verification**: Verifies that `targetWindow` belongs to the same user SID and an allowlisted LLM/IDE/Terminal executable before dispatching synthetic keystrokes.
-  - **Privacy-by-Design Clipboard Preservation**: Saves and restores your previous `CF_UNICODETEXT` clipboard content after dispatching an answer, and marks temporary clipboard writes with `ExcludeClipboardContentFromMonitorProcessing` + `CanIncludeInClipboardHistory = 0`.
-  - **Anti-Clickjacking / UI Spoofing Guard**: Enforces a 220ms anti-clickjacking grace window on freshly popped HUDs (`security-awareness`) and sanitizes control/Bidi characters (`appsec`).
+- **Automatic Detection + Built-in Demo Preview**:
+  - Automatically pops up a welcome preview in `explorer.exe` when first compiled/enabled (configurable via `showDemoOnStartup`) so you can immediately feel the springs and hover popovers.
+  - Hooks `SetWindowTextW` (window title status completion transitions), `FlashWindowEx`, and `Shell_NotifyIconW` in `Antigravity.exe`, `Cursor.exe`, `Code.exe`, `Claude.exe`, and `WindowsTerminal.exe`.
+  - Includes `tools/agy_stop_hook.py` to hook directly into Antigravity / Claude Code `Stop` lifecycle events so every completed LLM turn automatically extracts the response summary & options and pops up the HUD.
 */
 // ==/WindhawkModReadme==
 
@@ -60,6 +54,9 @@ An Apple-inspired **Liquid Glass floating HUD** positioned near the bottom taskb
 - interceptToasts: true
   $name: Intercept LLM App Notifications & Taskbar Flashes
   $description: Automatically trigger the Glass HUD when Antigravity, Cursor, VS Code, Claude, or Terminal fires a notification or flashes on cycle completion.
+- showDemoOnStartup: true
+  $name: Show Welcome Preview on Mod Start / Reload
+  $description: Automatically pop up the Apple Liquid Glass HUD once when the mod loads in explorer.exe so you can test the animations and hover popovers immediately.
 */
 // ==/WindhawkModSettings==
 
@@ -111,11 +108,12 @@ struct ModSettings {
     int autoDismissSeconds = 18;
     bool enableHotkeys = true;
     bool interceptToasts = true;
+    bool showDemoOnStartup = true;
 } g_settings;
 
 struct OptionEntry {
-    std::wstring shortSubtitle; // Shown on the pill button
-    std::wstring fullText;      // Sent to LLM & shown in hover glass popover when large
+    std::wstring shortSubtitle;
+    std::wstring fullText;
     bool isLarge = false;
 };
 
@@ -160,9 +158,6 @@ static std::wstring SanitizeUntrustedString(const std::wstring& input, size_t ma
     return out;
 }
 
-// Extracts a concise subtitle/button label when an LLM provides a really large option or description.
-// Supports explicit `Subtitle :: Full details`, natural `Subtitle: Full details`, `Subtitle — Full details`,
-// or smart word-boundary truncation.
 static void SplitSubtitleAndFullText(
     const std::wstring& rawInput,
     size_t maxSubtitleChars,
@@ -175,7 +170,6 @@ static void SplitSubtitleAndFullText(
     outFull = cleaned;
     outIsLarge = false;
 
-    // 1. Check for explicit "::" separator (e.g. "Fast Migration :: Runs in-place schema update without downtime...")
     size_t dblColon = cleaned.find(L"::");
     if (dblColon != std::wstring::npos && dblColon > 2 && dblColon <= maxSubtitleChars + 8) {
         outSubtitle = cleaned.substr(0, dblColon);
@@ -189,7 +183,6 @@ static void SplitSubtitleAndFullText(
         return;
     }
 
-    // If already short enough to fit comfortably, no truncation needed
     if (cleaned.size() <= maxSubtitleChars) {
         outSubtitle = cleaned;
         outIsLarge = false;
@@ -198,7 +191,6 @@ static void SplitSubtitleAndFullText(
 
     outIsLarge = true;
 
-    // 2. Look for a natural subtitle delimiter (": ", " - ", " — ", " – ", " (") within the first maxSubtitleChars
     const wchar_t* delimiters[] = { L": ", L" — ", L" – ", L" - ", L" (" };
     for (const wchar_t* delim : delimiters) {
         size_t pos = cleaned.find(delim);
@@ -208,13 +200,12 @@ static void SplitSubtitleAndFullText(
         }
     }
 
-    // 3. Otherwise truncate cleanly at the last word boundary before maxSubtitleChars
     size_t cut = maxSubtitleChars - 1;
     size_t lastSpace = cleaned.rfind(L' ', cut);
     if (lastSpace != std::wstring::npos && lastSpace >= maxSubtitleChars / 2) {
         cut = lastSpace;
     }
-    outSubtitle = cleaned.substr(0, cut) + L"\x2026"; // Single-char ellipsis '…'
+    outSubtitle = cleaned.substr(0, cut) + L"\x2026";
 }
 
 static bool CreateOwnerOnlySecurityDescriptor(PSECURITY_DESCRIPTOR* ppSD) {
@@ -327,7 +318,6 @@ static void SetEphemeralClipboardText(HWND ownerHwnd, const std::wstring& text) 
     CloseClipboard();
 }
 
-// 1D Second-Order Spring Solver
 struct Spring1D {
     float value = 0.0f;
     float target = 0.0f;
@@ -359,7 +349,6 @@ struct PointerSample {
     LONGLONG qpcTicks = 0;
 };
 
-// Reserve top canvas above the main card so the hover popover can render and scale smoothly
 static const int kPopoverCanvasReservePx = 152;
 
 struct HudChoreography {
@@ -371,9 +360,8 @@ struct HudChoreography {
     Spring1D pillScale[4];
     Spring1D pillHover[4];
 
-    // Origin-aware hover popover springs for viewing full text of large options or descriptions
-    Spring1D popoverProgress;   // 0.0 (hidden) -> 1.0 (open)
-    Spring1D popoverAnchorX;    // Smooth horizontal origin tracking across pills (instant neighbour switch)
+    Spring1D popoverProgress;
+    Spring1D popoverAnchorX;
     std::wstring popoverHeading;
     std::wstring popoverBody;
     bool popoverActive = false;
@@ -462,6 +450,30 @@ static OptionEntry MakeOptionEntry(const std::wstring& rawOpt) {
     OptionEntry entry;
     SplitSubtitleAndFullText(rawOpt, 26, 650, entry.shortSubtitle, entry.fullText, entry.isLarge);
     return entry;
+}
+
+static LLMCyclePayload MakeWelcomeDemoPayload() {
+    LLMCyclePayload p;
+    p.sourceApp = L"Antigravity";
+    p.modelBadge = L"HUD Active \x00B7 v1.4";
+    p.title = L"LLM Liquid Glass HUD is Ready";
+    SplitSubtitleAndFullText(
+        L"Hover any option with '\x22EF' or this description to inspect full multi-line LLM outputs in an origin-aware Apple Liquid Glass Popover. Drag down to flick-dismiss!",
+        68, 900, p.summaryShort, p.summaryFull, p.summaryIsLarge
+    );
+    p.options.push_back(MakeOptionEntry(
+        L"Zero-Downtime Dual-Write :: Creates shadow columns with dual-write triggers, backfills 1.4M rows in 10k batches, and swaps views atomically with zero lock contention."
+    ));
+    p.options.push_back(MakeOptionEntry(
+        L"Blue-Green Replica Swap :: Applies DDL on read-replica, verifies checksums against primary WAL stream, and promotes replica via connection pooler cutover."
+    ));
+    p.options.push_back(MakeOptionEntry(
+        L"Maintenance Lock Migration :: Acquires ACCESS EXCLUSIVE table lock inside a single transaction and runs ALTER TABLE directly (~9s)."
+    ));
+    p.options.push_back(MakeOptionEntry(
+        L"Dry-Run Explain Plan Only :: Generates the full SQL migration script and runs EXPLAIN ANALYZE inside a rolled-back transaction on staging."
+    ));
+    return p;
 }
 
 static LLMCyclePayload ParsePipeMessage(const std::wstring& raw) {
@@ -696,7 +708,6 @@ static BYTE LerpByte(int a, int b, float t) {
     return static_cast<BYTE>(std::clamp(static_cast<int>(std::round(a + (b - a) * t)), 0, 255));
 }
 
-// Render both the main Apple Liquid Glass HUD and the origin-aware Hover Detail Popover
 static void RenderGlassHud(HWND hwnd) {
     LLMCyclePayload payload;
     {
@@ -764,9 +775,6 @@ static void RenderGlassHud(HWND hwnd) {
         Font popTitleFont(fam, 12.0f, FontStyleBold, UnitPixel);
         Font popBodyFont(fam, 12.5f, FontStyleRegular, UnitPixel);
 
-        // ====================================================================
-        // 1. Main Bottom Liquid Glass Card
-        // ====================================================================
         RectF cardRect(2.0f, cardTopY + 2.0f, static_cast<float>(width - 4), static_cast<float>(cardHeight - 4));
         GraphicsPath cardPath;
         AddRoundRect(cardPath, cardRect, 20.0f);
@@ -811,7 +819,6 @@ static void RenderGlassHud(HWND hwnd) {
         g.DrawString(payload.modelBadge.c_str(), -1, &badgeFont,
                      RectF(width - 175.0f, cardTopY + 19.0f, 155.0f, 20.0f), &rightFmt, &accentBrush);
 
-        // Summary / Subtitle Row (with hover highlight if summary is large)
         std::wstring shownSummary = payload.summaryShort;
         if (payload.summaryIsLarge) {
             shownSummary += L"  [Hover for full]";
@@ -870,7 +877,6 @@ static void RenderGlassHud(HWND hwnd) {
                 g.FillPath(&optFill, &optPath);
                 g.DrawPath(&optPen, &optPath);
 
-                // Show concise subtitle on button + subtle '⋯' badge if full text is larger
                 std::wstring optLabel = std::to_wstring(i + 1) + L"   " + payload.options[i].shortSubtitle;
                 StringFormat vCenter;
                 vCenter.SetLineAlignment(StringAlignmentCenter);
@@ -910,9 +916,6 @@ static void RenderGlassHud(HWND hwnd) {
                          RectF(30.0f, cardTopY + 84.0f, static_cast<float>(width - 60), 34.0f), &vCenter, &textBrush);
         }
 
-        // ====================================================================
-        // 2. Origin-Aware Apple Liquid Glass Hover Popover (for large choices/descriptions)
-        // ====================================================================
         float popT = std::clamp(g_anim.popoverProgress.value, 0.0f, 1.0f);
         if (popT > 0.01f && !g_anim.popoverBody.empty()) {
             GraphicsState popState = g.Save();
@@ -922,10 +925,9 @@ static void RenderGlassHud(HWND hwnd) {
             float popX = 14.0f;
             float popY = 6.0f + (1.0f - popT) * 10.0f;
 
-            // Scale from the hovered option's horizontal anchor (`transform-origin: var(--transform-origin)`)
             float originX = std::clamp(g_anim.popoverAnchorX.value, 60.0f, static_cast<float>(width - 60));
             float originY = popY + popH;
-            float popScale = 0.95f + 0.05f * popT; // Never scale from 0! Starts at 0.95
+            float popScale = 0.95f + 0.05f * popT;
 
             g.TranslateTransform(originX, originY);
             g.ScaleTransform(popScale, popScale);
@@ -939,7 +941,6 @@ static void RenderGlassHud(HWND hwnd) {
             GraphicsPath popPath;
             AddRoundRect(popPath, popRect, 16.0f);
 
-            // Darker/thicker elevated glass material for floating popover hierarchy
             LinearGradientBrush popGlass(
                 PointF(0.0f, popY),
                 PointF(0.0f, popY + popH),
@@ -1192,7 +1193,7 @@ static LRESULT CALLBACK GlassHudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             if (g_anim.isDragging || g_anim.IsWithinClickjackGraceWindow()) return 0;
             int x = GET_X_LPARAM(lParam);
             int y = GET_Y_LPARAM(lParam);
-            if (y < kPopoverCanvasReservePx) return 0; // Ignore clicks in transparent upper area
+            if (y < kPopoverCanvasReservePx) return 0;
 
             int optIdx = HitTestOption(x, y);
             if (optIdx >= 0) {
@@ -1261,7 +1262,6 @@ static LRESULT CALLBACK GlassHudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     g_anim.pillHover[i].target = (i == hoveredOpt) ? 1.0f : 0.0f;
                 }
 
-                // Update origin-aware full-text hover popover when hovering a large option or large summary
                 LLMCyclePayload payload;
                 {
                     std::lock_guard<std::mutex> lock(g_payloadMutex);
@@ -1273,7 +1273,7 @@ static LRESULT CALLBACK GlassHudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     if (!g_anim.popoverActive) {
                         g_anim.popoverAnchorX.Reset(optCenterX, optCenterX);
                     } else {
-                        g_anim.popoverAnchorX.target = optCenterX; // Instant neighbour transition!
+                        g_anim.popoverAnchorX.target = optCenterX;
                     }
                     g_anim.popoverActive = true;
                     g_anim.popoverHeading = L"Option " + std::to_wstring(hoveredOpt + 1) + L" \x00B7 " +
@@ -1437,6 +1437,14 @@ static DWORD WINAPI HudHostThreadProc(LPVOID) {
         nullptr, nullptr, wc.hInstance, nullptr
     );
 
+    if (g_settings.showDemoOnStartup && g_hudHwnd) {
+        {
+            std::lock_guard<std::mutex> lock(g_payloadMutex);
+            g_currentPayload = MakeWelcomeDemoPayload();
+        }
+        PostMessageW(g_hudHwnd, WM_APP_SHOW_LLM_HUD, 0, 0);
+    }
+
     std::thread pipeListener([]() {
         PSECURITY_DESCRIPTOR pSD = nullptr;
         bool hasSD = CreateOwnerOnlySecurityDescriptor(&pSD);
@@ -1568,6 +1576,7 @@ static void LoadSettings() {
     g_settings.autoDismissSeconds = Wh_GetIntSetting(L"autoDismissSeconds");
     g_settings.enableHotkeys = Wh_GetIntSetting(L"enableHotkeys") != 0;
     g_settings.interceptToasts = Wh_GetIntSetting(L"interceptToasts") != 0;
+    g_settings.showDemoOnStartup = Wh_GetIntSetting(L"showDemoOnStartup") != 0;
 }
 
 BOOL Wh_ModInit() {
@@ -1603,9 +1612,17 @@ BOOL Wh_ModInit() {
 
 void Wh_ModSettingsChanged() {
     LoadSettings();
-    if (g_isExplorerHost && g_hudHwnd && g_anim.visible) {
-        ApplyAppleGlassBackdrop(g_hudHwnd);
-        RenderGlassHud(g_hudHwnd);
+    if (g_isExplorerHost && g_hudHwnd) {
+        if (g_settings.showDemoOnStartup && !g_anim.visible) {
+            {
+                std::lock_guard<std::mutex> lock(g_payloadMutex);
+                g_currentPayload = MakeWelcomeDemoPayload();
+            }
+            PostMessageW(g_hudHwnd, WM_APP_SHOW_LLM_HUD, 0, 0);
+        } else if (g_anim.visible) {
+            ApplyAppleGlassBackdrop(g_hudHwnd);
+            RenderGlassHud(g_hudHwnd);
+        }
     }
 }
 
