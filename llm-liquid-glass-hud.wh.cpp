@@ -1,0 +1,1633 @@
+// ==WindhawkMod==
+// @id              llm-liquid-glass-hud
+// @name            LLM Liquid Glass HUD (Apple Spotlight & Dynamic Notification)
+// @description     Apple Liquid Glass floating HUD near the taskbar that pops up when an LLM finishes a cycle, displays interactive multiple-choice options or summary text, and lets you reply/select without leaving your active window.
+// @version         1.3.0
+// @author          kg-sato
+// @github          https://github.com/kg-sato/LLM-Liquid-Glass
+// @include         explorer.exe
+// @include         Antigravity.exe
+// @include         Cursor.exe
+// @include         Code.exe
+// @include         Claude.exe
+// @include         WindowsTerminal.exe
+// @architecture    x86-64
+// @compilerOptions -lgdi32 -luser32 -ldwmapi -lgdiplus -lole32 -lshell32 -lshlwapi -ladvapi32
+// ==/WindhawkMod==
+
+// ==WindhawkModReadme==
+/*
+# LLM Liquid Glass HUD
+
+An Apple-inspired **Liquid Glass floating HUD** positioned near the bottom taskbar (Spotlight / visionOS style) that automatically surfaces when an LLM or coding agent finishes a cycle.
+
+## Key Features
+- **Apple Liquid Glass Material**: Uses Windows 11 DWM Acrylic/Mica system backdrops combined with a high-DPI GDI+ specular rim highlight, soft elevation shadow, and optical typography.
+- **Smart Compact Labels & Instant Hover Popover for Large LLM Outputs**:
+  - When an LLM provides a long option or multi-sentence description, the button automatically displays the concise **subtitle/heading** (e.g., before `:` or `—`, or a smartly truncated label) with a subtle `⋯` indicator.
+  - Hovering any truncated option pill or long summary description springs open an **origin-aware Apple Liquid Glass Popover** above the HUD showing the full multi-line text.
+  - Supports Emil Kowalski's **instant neighbour tooltip rule**: once the hover popover is open, moving across adjacent options updates and repositions it immediately with zero re-entry delay.
+- **High-Precision 120Hz Spring Physics & Gesture Dismissal**:
+  - Uses `QueryPerformanceCounter` (QPC) delta-time integration at up to 120fps (`8ms` frame step) so motion stays locked to display velocity with zero frame-time drift.
+  - Multi-property coupled springs: position (`ySpring`), true matrix scale (`scaleSpring` anchored at bottom-center `transform-origin`), height morph (`heightSpring`), opacity (`opacitySpring`), per-pill hover/press springs (`pillScale[4]`, `pillHover[4]`), and popover spring (`popoverSpring`).
+  - 4-sample ring-buffer velocity tracker during 1:1 pointer-captured drag, progressive rubber-banding (`c = 0.55`), and Apple exponential decay momentum projection (`decelerationRate = 0.994`) with velocity handoff.
+  - Respects Windows `SPI_GETCLIENTAREAANIMATION` (`prefers-reduced-motion`).
+- **Security & Privacy Hardened (`cybersecurity-skills` Verified)**:
+  - **IAM / Least-Privilege Named Pipe DACL**: Pipe is locked exclusively to the current logon user SID (`TOKEN_USER`) + `PIPE_REJECT_REMOTE_CLIENTS`.
+  - **Confused-Deputy Target Window Verification**: Verifies that `targetWindow` belongs to the same user SID and an allowlisted LLM/IDE/Terminal executable before dispatching synthetic keystrokes.
+  - **Privacy-by-Design Clipboard Preservation**: Saves and restores your previous `CF_UNICODETEXT` clipboard content after dispatching an answer, and marks temporary clipboard writes with `ExcludeClipboardContentFromMonitorProcessing` + `CanIncludeInClipboardHistory = 0`.
+  - **Anti-Clickjacking / UI Spoofing Guard**: Enforces a 220ms anti-clickjacking grace window on freshly popped HUDs (`security-awareness`) and sanitizes control/Bidi characters (`appsec`).
+*/
+// ==/WindhawkModReadme==
+
+// ==WindhawkModSettings==
+/*
+- glassOpacity: 215
+  $name: Glass Surface Opacity (0-255)
+  $description: Opacity of the dark smoky Apple glass tint over the DWM Acrylic blur.
+- bottomOffsetPx: 64
+  $name: Bottom Offset from Screen Edge (px)
+  $description: Distance above the bottom of the primary monitor (above the taskbar).
+- hudWidthPx: 540
+  $name: HUD Width (px)
+  $description: Width of the Spotlight-style floating glass bar.
+- autoDismissSeconds: 18
+  $name: Auto-Dismiss Timeout (seconds)
+  $description: Set to 0 to keep the HUD visible until you click an option or swipe it away.
+- enableHotkeys: true
+  $name: Enable Alt+1..4 Quick Option Hotkeys
+  $description: Press Alt+1, Alt+2, Alt+3, or Alt+4 while the HUD is visible to answer without touching the mouse.
+- interceptToasts: true
+  $name: Intercept LLM App Notifications & Taskbar Flashes
+  $description: Automatically trigger the Glass HUD when Antigravity, Cursor, VS Code, Claude, or Terminal fires a notification or flashes on cycle completion.
+*/
+// ==/WindhawkModSettings==
+
+#include <windows.h>
+#include <windowsx.h>
+#include <dwmapi.h>
+#include <shellapi.h>
+#include <shlwapi.h>
+#include <aclapi.h>
+#include <sddl.h>
+#include <objidl.h>
+#include <gdiplus.h>
+#include <cmath>
+#include <string>
+#include <vector>
+#include <mutex>
+#include <atomic>
+#include <thread>
+#include <algorithm>
+
+using namespace Gdiplus;
+
+struct ACCENT_POLICY {
+    int AccentState;
+    int AccentFlags;
+    DWORD GradientColor;
+    int AnimationId;
+};
+
+struct WINDOWCOMPOSITIONATTRIBDATA {
+    DWORD Attrib;
+    PVOID pvData;
+    SIZE_T cbData;
+};
+
+using pfnSetWindowCompositionAttribute = BOOL(WINAPI*)(HWND, WINDOWCOMPOSITIONATTRIBDATA*);
+
+enum ACCENT_STATE {
+    ACCENT_DISABLED = 0,
+    ACCENT_ENABLE_BLURBEHIND = 3,
+    ACCENT_ENABLE_ACRYLICBLURBEHIND = 4,
+    ACCENT_ENABLE_HOSTBACKDROP = 5
+};
+
+struct ModSettings {
+    int glassOpacity = 215;
+    int bottomOffsetPx = 64;
+    int hudWidthPx = 540;
+    int autoDismissSeconds = 18;
+    bool enableHotkeys = true;
+    bool interceptToasts = true;
+} g_settings;
+
+struct OptionEntry {
+    std::wstring shortSubtitle; // Shown on the pill button
+    std::wstring fullText;      // Sent to LLM & shown in hover glass popover when large
+    bool isLarge = false;
+};
+
+struct LLMCyclePayload {
+    std::wstring sourceApp = L"Antigravity";
+    std::wstring modelBadge = L"Cycle Complete";
+    std::wstring title = L"Agent finished turn";
+    std::wstring summaryShort = L"Ready for your next instruction or option selection.";
+    std::wstring summaryFull = L"Ready for your next instruction or option selection.";
+    bool summaryIsLarge = false;
+    std::vector<OptionEntry> options;
+    HWND targetWindow = nullptr;
+};
+
+static bool g_isExplorerHost = false;
+static std::atomic<bool> g_shuttingDown{false};
+static HWND g_hudHwnd = nullptr;
+static HANDLE g_pipeThread = nullptr;
+static ULONG_PTR g_gdiplusToken = 0;
+static std::mutex g_payloadMutex;
+static LLMCyclePayload g_currentPayload;
+
+// ============================================================================
+// Security, Privacy & Smart Subtitle Extraction Helpers
+// ============================================================================
+
+static std::wstring SanitizeUntrustedString(const std::wstring& input, size_t maxLen) {
+    std::wstring out;
+    out.reserve(std::min(input.size(), maxLen));
+    for (wchar_t ch : input) {
+        if (out.size() >= maxLen) break;
+        if (ch == L'\r' || ch == L'\n' || ch == L'\t') {
+            if (!out.empty() && out.back() != L' ') out.push_back(L' ');
+            continue;
+        }
+        if (ch < 0x20 || (ch >= 0x7F && ch <= 0x9F) ||
+            (ch >= 0x202A && ch <= 0x202E) || (ch >= 0x2066 && ch <= 0x2069)) {
+            continue;
+        }
+        out.push_back(ch);
+    }
+    return out;
+}
+
+// Extracts a concise subtitle/button label when an LLM provides a really large option or description.
+// Supports explicit `Subtitle :: Full details`, natural `Subtitle: Full details`, `Subtitle — Full details`,
+// or smart word-boundary truncation.
+static void SplitSubtitleAndFullText(
+    const std::wstring& rawInput,
+    size_t maxSubtitleChars,
+    size_t maxFullChars,
+    std::wstring& outSubtitle,
+    std::wstring& outFull,
+    bool& outIsLarge
+) {
+    std::wstring cleaned = SanitizeUntrustedString(rawInput, maxFullChars);
+    outFull = cleaned;
+    outIsLarge = false;
+
+    // 1. Check for explicit "::" separator (e.g. "Fast Migration :: Runs in-place schema update without downtime...")
+    size_t dblColon = cleaned.find(L"::");
+    if (dblColon != std::wstring::npos && dblColon > 2 && dblColon <= maxSubtitleChars + 8) {
+        outSubtitle = cleaned.substr(0, dblColon);
+        while (!outSubtitle.empty() && outSubtitle.back() == L' ') outSubtitle.pop_back();
+        std::wstring remainder = cleaned.substr(dblColon + 2);
+        size_t firstNonSpace = remainder.find_first_not_of(L' ');
+        outFull = (firstNonSpace != std::wstring::npos)
+            ? (outSubtitle + L" — " + remainder.substr(firstNonSpace))
+            : outSubtitle;
+        outIsLarge = (outFull.size() > outSubtitle.size());
+        return;
+    }
+
+    // If already short enough to fit comfortably, no truncation needed
+    if (cleaned.size() <= maxSubtitleChars) {
+        outSubtitle = cleaned;
+        outIsLarge = false;
+        return;
+    }
+
+    outIsLarge = true;
+
+    // 2. Look for a natural subtitle delimiter (": ", " - ", " — ", " – ", " (") within the first maxSubtitleChars
+    const wchar_t* delimiters[] = { L": ", L" — ", L" – ", L" - ", L" (" };
+    for (const wchar_t* delim : delimiters) {
+        size_t pos = cleaned.find(delim);
+        if (pos != std::wstring::npos && pos >= 4 && pos <= maxSubtitleChars) {
+            outSubtitle = cleaned.substr(0, pos);
+            return;
+        }
+    }
+
+    // 3. Otherwise truncate cleanly at the last word boundary before maxSubtitleChars
+    size_t cut = maxSubtitleChars - 1;
+    size_t lastSpace = cleaned.rfind(L' ', cut);
+    if (lastSpace != std::wstring::npos && lastSpace >= maxSubtitleChars / 2) {
+        cut = lastSpace;
+    }
+    outSubtitle = cleaned.substr(0, cut) + L"\x2026"; // Single-char ellipsis '…'
+}
+
+static bool CreateOwnerOnlySecurityDescriptor(PSECURITY_DESCRIPTOR* ppSD) {
+    *ppSD = nullptr;
+    HANDLE hToken = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+        return false;
+    }
+
+    DWORD tokenInfoLen = 0;
+    GetTokenInformation(hToken, TokenUser, nullptr, 0, &tokenInfoLen);
+    if (tokenInfoLen == 0) {
+        CloseHandle(hToken);
+        return false;
+    }
+
+    std::vector<BYTE> tokenUserBuf(tokenInfoLen);
+    if (!GetTokenInformation(hToken, TokenUser, tokenUserBuf.data(), tokenInfoLen, &tokenInfoLen)) {
+        CloseHandle(hToken);
+        return false;
+    }
+    CloseHandle(hToken);
+
+    PSID pUserSid = reinterpret_cast<PTOKEN_USER>(tokenUserBuf.data())->User.Sid;
+    LPWSTR sidStr = nullptr;
+    if (!ConvertSidToStringSidW(pUserSid, &sidStr)) {
+        return false;
+    }
+
+    std::wstring sddl = L"D:P(A;;GA;;;" + std::wstring(sidStr) + L")";
+    LocalFree(sidStr);
+
+    return ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl.c_str(), SDDL_REVISION_1, ppSD, nullptr) != FALSE;
+}
+
+static bool IsAuthorizedTargetWindow(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return false;
+
+    DWORD targetPid = 0;
+    GetWindowThreadProcessId(hwnd, &targetPid);
+    if (targetPid == 0) return false;
+
+    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, targetPid);
+    if (!hProc) return false;
+
+    wchar_t exePath[MAX_PATH] = {};
+    DWORD cchPath = MAX_PATH;
+    bool allowedExe = false;
+    if (QueryFullProcessImageNameW(hProc, 0, exePath, &cchPath)) {
+        const wchar_t* baseName = PathFindFileNameW(exePath);
+        static const wchar_t* kAllowedProcesses[] = {
+            L"Antigravity.exe", L"Cursor.exe", L"Code.exe", L"Claude.exe",
+            L"WindowsTerminal.exe", L"pwsh.exe", L"powershell.exe", L"cmd.exe",
+            L"conhost.exe", L"OpenConsole.exe", L"wezterm-gui.exe", L"alacritty.exe"
+        };
+        for (const wchar_t* allowed : kAllowedProcesses) {
+            if (_wcsicmp(baseName, allowed) == 0) {
+                allowedExe = true;
+                break;
+            }
+        }
+    }
+    CloseHandle(hProc);
+    return allowedExe;
+}
+
+static void SetEphemeralClipboardText(HWND ownerHwnd, const std::wstring& text) {
+    if (!OpenClipboard(ownerHwnd)) return;
+    EmptyClipboard();
+
+    size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (hMem) {
+        void* ptr = GlobalLock(hMem);
+        if (ptr) {
+            memcpy(ptr, text.c_str(), bytes);
+            GlobalUnlock(hMem);
+            if (!SetClipboardData(CF_UNICODETEXT, hMem)) {
+                GlobalFree(hMem);
+            }
+        } else {
+            GlobalFree(hMem);
+        }
+    }
+
+    static UINT cfExcludeMonitor = RegisterClipboardFormatW(L"ExcludeClipboardContentFromMonitorProcessing");
+    static UINT cfCanIncludeHistory = RegisterClipboardFormatW(L"CanIncludeInClipboardHistory");
+    static UINT cfCanUploadCloud = RegisterClipboardFormatW(L"CanUploadToCloudClipboard");
+
+    auto setDwordFormat = [](UINT fmt, DWORD val) {
+        if (!fmt) return;
+        HGLOBAL hFlag = GlobalAlloc(GMEM_MOVEABLE, sizeof(DWORD));
+        if (hFlag) {
+            DWORD* p = static_cast<DWORD*>(GlobalLock(hFlag));
+            if (p) {
+                *p = val;
+                GlobalUnlock(hFlag);
+                if (!SetClipboardData(fmt, hFlag)) GlobalFree(hFlag);
+            } else {
+                GlobalFree(hFlag);
+            }
+        }
+    };
+
+    setDwordFormat(cfExcludeMonitor, 1);
+    setDwordFormat(cfCanIncludeHistory, 0);
+    setDwordFormat(cfCanUploadCloud, 0);
+
+    CloseClipboard();
+}
+
+// 1D Second-Order Spring Solver
+struct Spring1D {
+    float value = 0.0f;
+    float target = 0.0f;
+    float velocity = 0.0f;
+
+    void Reset(float initial, float tgt, float vel = 0.0f) {
+        value = initial;
+        target = tgt;
+        velocity = vel;
+    }
+
+    bool Step(float dt, float omega = 22.0f, float zeta = 1.0f) {
+        float disp = value - target;
+        if (std::fabs(disp) < 0.0015f && std::fabs(velocity) < 0.015f) {
+            value = target;
+            velocity = 0.0f;
+            return false;
+        }
+        const float damping = 2.0f * zeta * omega;
+        const float accel = -omega * omega * disp - damping * velocity;
+        velocity += accel * dt;
+        value += velocity * dt;
+        return true;
+    }
+};
+
+struct PointerSample {
+    float y = 0.0f;
+    LONGLONG qpcTicks = 0;
+};
+
+// Reserve top canvas above the main card so the hover popover can render and scale smoothly
+static const int kPopoverCanvasReservePx = 152;
+
+struct HudChoreography {
+    Spring1D ySpring;
+    Spring1D scaleSpring;
+    Spring1D opacitySpring;
+    Spring1D heightSpring;
+    Spring1D contentFadeSpring;
+    Spring1D pillScale[4];
+    Spring1D pillHover[4];
+
+    // Origin-aware hover popover springs for viewing full text of large options or descriptions
+    Spring1D popoverProgress;   // 0.0 (hidden) -> 1.0 (open)
+    Spring1D popoverAnchorX;    // Smooth horizontal origin tracking across pills (instant neighbour switch)
+    std::wstring popoverHeading;
+    std::wstring popoverBody;
+    bool popoverActive = false;
+
+    bool visible = false;
+    bool dismissing = false;
+    float yZeta = 1.0f;
+
+    bool isDragging = false;
+    POINT dragStartScreenPt = {0, 0};
+    float dragStartOffsetY = 0.0f;
+    PointerSample history[4] = {};
+    int historyCount = 0;
+
+    int hoveredOption = -1;
+    bool hoveredSummary = false;
+    int pressedOption = -1;
+    bool replyBoxFocused = false;
+    std::wstring replyDraft;
+    LONGLONG lastFrameQpc = 0;
+    LONGLONG showQpc = 0;
+    LONGLONG qpcFreq = 1;
+
+    void InitSprings() {
+        QueryPerformanceFrequency(reinterpret_cast<LARGE_INTEGER*>(&qpcFreq));
+        for (int i = 0; i < 4; ++i) {
+            pillScale[i].Reset(1.0f, 1.0f);
+            pillHover[i].Reset(0.0f, 0.0f);
+        }
+        contentFadeSpring.Reset(1.0f, 1.0f);
+        popoverProgress.Reset(0.0f, 0.0f);
+        popoverAnchorX.Reset(270.0f, 270.0f);
+    }
+
+    bool IsWithinClickjackGraceWindow() const {
+        if (showQpc == 0 || qpcFreq == 0) return false;
+        LONGLONG now = 0;
+        QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&now));
+        double elapsedMs = (static_cast<double>(now - showQpc) * 1000.0) / static_cast<double>(qpcFreq);
+        return elapsedMs < 220.0;
+    }
+
+    void PushPointerSample(float screenY) {
+        LONGLONG now = 0;
+        QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&now));
+        for (int i = 3; i > 0; --i) {
+            history[i] = history[i - 1];
+        }
+        history[0] = {screenY, now};
+        if (historyCount < 4) historyCount++;
+    }
+
+    float ComputeReleaseVelocityPxPerSec() const {
+        if (historyCount < 2) return 0.0f;
+        int oldest = historyCount - 1;
+        double dtSec = static_cast<double>(history[0].qpcTicks - history[oldest].qpcTicks) /
+                       static_cast<double>(qpcFreq);
+        if (dtSec <= 0.0005 || dtSec > 0.25) return 0.0f;
+        return static_cast<float>((history[0].y - history[oldest].y) / dtSec);
+    }
+} g_anim;
+
+static const UINT_PTR TIMER_SPRING_FRAME = 1001;
+static const UINT_PTR TIMER_AUTO_DISMISS = 1002;
+static const UINT WM_APP_SHOW_LLM_HUD = WM_APP + 0x42;
+static const wchar_t* kPipeName = L"\\\\.\\pipe\\WindhawkLLMGlassHUD";
+static const wchar_t* kHudClassName = L"Windhawk_AppleLiquidGlassHUD";
+
+static bool IsReducedMotionEnabled() {
+    BOOL clientAnim = TRUE;
+    if (SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &clientAnim, 0)) {
+        return !clientAnim;
+    }
+    return false;
+}
+
+static float RubberBand(float overshoot, float dimension, float constant = 0.55f) {
+    return (overshoot * dimension * constant) / (dimension + constant * std::fabs(overshoot));
+}
+
+static float ProjectMomentum(float initialVelocityPxPerSec, float decelerationRate = 0.998f) {
+    return (initialVelocityPxPerSec / 1000.0f) * decelerationRate / (1.0f - decelerationRate);
+}
+
+static OptionEntry MakeOptionEntry(const std::wstring& rawOpt) {
+    OptionEntry entry;
+    SplitSubtitleAndFullText(rawOpt, 26, 650, entry.shortSubtitle, entry.fullText, entry.isLarge);
+    return entry;
+}
+
+static LLMCyclePayload ParsePipeMessage(const std::wstring& raw) {
+    LLMCyclePayload p;
+    std::vector<std::wstring> parts;
+    size_t start = 0;
+    while (true) {
+        size_t pos = raw.find(L'|', start);
+        if (pos == std::wstring::npos) {
+            parts.push_back(raw.substr(start));
+            break;
+        }
+        parts.push_back(raw.substr(start, pos - start));
+        start = pos + 1;
+    }
+
+    if (parts.size() >= 1 && !parts[0].empty()) p.sourceApp = SanitizeUntrustedString(parts[0], 40);
+    if (parts.size() >= 2 && !parts[1].empty()) p.modelBadge = SanitizeUntrustedString(parts[1], 36);
+    if (parts.size() >= 3 && !parts[2].empty()) p.title = SanitizeUntrustedString(parts[2], 96);
+    if (parts.size() >= 4 && !parts[3].empty()) {
+        SplitSubtitleAndFullText(parts[3], 68, 900, p.summaryShort, p.summaryFull, p.summaryIsLarge);
+    }
+    if (parts.size() >= 5 && !parts[4].empty()) {
+        ULONG_PTR hwndVal = wcstoull(parts[4].c_str(), nullptr, 16);
+        HWND candidate = reinterpret_cast<HWND>(hwndVal);
+        if (IsAuthorizedTargetWindow(candidate)) {
+            p.targetWindow = candidate;
+        }
+    }
+    if (parts.size() >= 6 && !parts[5].empty()) {
+        size_t oStart = 0;
+        const std::wstring& optsStr = parts[5];
+        while (p.options.size() < 4) {
+            size_t semi = optsStr.find(L';', oStart);
+            std::wstring item = (semi == std::wstring::npos)
+                ? optsStr.substr(oStart)
+                : optsStr.substr(oStart, semi - oStart);
+            OptionEntry entry = MakeOptionEntry(item);
+            if (!entry.shortSubtitle.empty()) {
+                p.options.push_back(entry);
+            }
+            if (semi == std::wstring::npos) break;
+            oStart = semi + 1;
+        }
+    }
+    return p;
+}
+
+static void ExtractOptionsFromText(
+    const std::wstring& text,
+    std::wstring& outSummaryShort,
+    std::wstring& outSummaryFull,
+    bool& outSummaryIsLarge,
+    std::vector<OptionEntry>& outOptions
+) {
+    outOptions.clear();
+    std::vector<std::wstring> lines;
+    size_t start = 0;
+    while (start < text.size()) {
+        size_t end = text.find_first_of(L"\r\n", start);
+        if (end == std::wstring::npos) {
+            lines.push_back(text.substr(start));
+            break;
+        }
+        if (end > start) {
+            lines.push_back(text.substr(start, end - start));
+        }
+        start = end + 1;
+    }
+
+    std::wstring summaryAccum;
+    for (const auto& line : lines) {
+        size_t firstNonSpace = line.find_first_not_of(L" \t");
+        if (firstNonSpace == std::wstring::npos) continue;
+        std::wstring trimmed = line.substr(firstNonSpace);
+
+        if (outOptions.size() < 4 && trimmed.size() > 3 &&
+            ((trimmed[0] >= L'1' && trimmed[0] <= L'4') || (trimmed[0] >= L'A' && trimmed[0] <= L'D')) &&
+            (trimmed[1] == L')' || trimmed[1] == L'.' || trimmed[1] == L':')) {
+            size_t optStart = trimmed.find_first_not_of(L" \t", 2);
+            if (optStart != std::wstring::npos) {
+                OptionEntry entry = MakeOptionEntry(trimmed.substr(optStart));
+                if (!entry.shortSubtitle.empty()) {
+                    outOptions.push_back(entry);
+                }
+                continue;
+            }
+        }
+        if (!summaryAccum.empty()) summaryAccum += L" ";
+        summaryAccum += trimmed;
+    }
+
+    std::wstring rawSummary = summaryAccum.empty() ? text : summaryAccum;
+    SplitSubtitleAndFullText(rawSummary, 68, 900, outSummaryShort, outSummaryFull, outSummaryIsLarge);
+}
+
+static void DispatchToGlassHUD(const LLMCyclePayload& payload) {
+    std::wstring serialized = payload.sourceApp + L"|" +
+                              payload.modelBadge + L"|" +
+                              payload.title + L"|" +
+                              payload.summaryFull + L"|";
+    wchar_t hwndBuf[32] = {};
+    swprintf_s(hwndBuf, L"%llX", reinterpret_cast<unsigned long long>(payload.targetWindow));
+    serialized += hwndBuf;
+    serialized += L"|";
+    for (size_t i = 0; i < payload.options.size(); ++i) {
+        if (i > 0) serialized += L";";
+        serialized += payload.options[i].fullText;
+    }
+
+    if (g_isExplorerHost && g_hudHwnd) {
+        {
+            std::lock_guard<std::mutex> lock(g_payloadMutex);
+            g_currentPayload = payload;
+        }
+        PostMessageW(g_hudHwnd, WM_APP_SHOW_LLM_HUD, 0, 0);
+        return;
+    }
+
+    HANDLE hPipe = CreateFileW(
+        kPipeName,
+        GENERIC_WRITE,
+        0,
+        nullptr,
+        OPEN_EXISTING,
+        SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+        nullptr
+    );
+    if (hPipe != INVALID_HANDLE_VALUE) {
+        DWORD bytesWritten = 0;
+        WriteFile(hPipe, serialized.c_str(), static_cast<DWORD>(serialized.size() * sizeof(wchar_t)), &bytesWritten, nullptr);
+        CloseHandle(hPipe);
+    }
+}
+
+static void ApplyAppleGlassBackdrop(HWND hwnd) {
+    BOOL darkMode = TRUE;
+    DwmSetWindowAttribute(hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &darkMode, sizeof(darkMode));
+}
+
+static int ComputeTargetHudHeight(const LLMCyclePayload& p) {
+    if (!p.options.empty()) {
+        int rows = static_cast<int>((p.options.size() + 1) / 2);
+        return 104 + rows * 44;
+    }
+    return 132;
+}
+
+static void SendAnswerToLLM(const std::wstring& rawAnswerText, bool focusWindowOnly) {
+    std::wstring answerText = SanitizeUntrustedString(rawAnswerText, 650);
+    if (answerText.empty()) return;
+
+    HWND target = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_payloadMutex);
+        target = g_currentPayload.targetWindow;
+    }
+
+    std::wstring savedClipboard;
+    bool hadSavedClipboard = false;
+    if (!focusWindowOnly && OpenClipboard(g_hudHwnd)) {
+        HANDLE hExisting = GetClipboardData(CF_UNICODETEXT);
+        if (hExisting) {
+            const wchar_t* pStr = static_cast<const wchar_t*>(GlobalLock(hExisting));
+            if (pStr) {
+                savedClipboard = pStr;
+                hadSavedClipboard = true;
+                GlobalUnlock(hExisting);
+            }
+        }
+        CloseClipboard();
+    }
+
+    SetEphemeralClipboardText(g_hudHwnd, answerText);
+
+    if (!IsAuthorizedTargetWindow(target)) {
+        return;
+    }
+
+    if (focusWindowOnly) {
+        if (IsIconic(target)) ShowWindow(target, SW_RESTORE);
+        SetForegroundWindow(target);
+        return;
+    }
+
+    HWND previousForeground = GetForegroundWindow();
+    DWORD curThread = GetCurrentThreadId();
+    DWORD fgThread = previousForeground ? GetWindowThreadProcessId(previousForeground, nullptr) : 0;
+    DWORD targetThread = GetWindowThreadProcessId(target, nullptr);
+
+    BOOL attachedFg = (fgThread && fgThread != curThread) ? AttachThreadInput(curThread, fgThread, TRUE) : FALSE;
+    BOOL attachedTarget = (targetThread && targetThread != curThread) ? AttachThreadInput(curThread, targetThread, TRUE) : FALSE;
+
+    SetForegroundWindow(target);
+    Sleep(18);
+
+    if (GetForegroundWindow() == target) {
+        INPUT inputs[6] = {};
+        inputs[0].type = INPUT_KEYBOARD; inputs[0].ki.wVk = VK_CONTROL;
+        inputs[1].type = INPUT_KEYBOARD; inputs[1].ki.wVk = 'V';
+        inputs[2].type = INPUT_KEYBOARD; inputs[2].ki.wVk = 'V'; inputs[2].ki.dwFlags = KEYEVENTF_KEYUP;
+        inputs[3].type = INPUT_KEYBOARD; inputs[3].ki.wVk = VK_CONTROL; inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
+        inputs[4].type = INPUT_KEYBOARD; inputs[4].ki.wVk = VK_RETURN;
+        inputs[5].type = INPUT_KEYBOARD; inputs[5].ki.wVk = VK_RETURN; inputs[5].ki.dwFlags = KEYEVENTF_KEYUP;
+        SendInput(6, inputs, sizeof(INPUT));
+        Sleep(18);
+    }
+
+    if (previousForeground && IsWindow(previousForeground) && previousForeground != g_hudHwnd) {
+        SetForegroundWindow(previousForeground);
+    }
+
+    if (attachedTarget) AttachThreadInput(curThread, targetThread, FALSE);
+    if (attachedFg) AttachThreadInput(curThread, fgThread, FALSE);
+
+    if (hadSavedClipboard) {
+        SetEphemeralClipboardText(g_hudHwnd, savedClipboard);
+    }
+}
+
+static void AddRoundRect(GraphicsPath& path, RectF rect, float radius) {
+    float d = radius * 2.0f;
+    path.AddArc(rect.X, rect.Y, d, d, 180.0f, 90.0f);
+    path.AddArc(rect.GetRight() - d, rect.Y, d, d, 270.0f, 90.0f);
+    path.AddArc(rect.GetRight() - d, rect.GetBottom() - d, d, d, 0.0f, 90.0f);
+    path.AddArc(rect.X, rect.GetBottom() - d, d, d, 90.0f, 90.0f);
+    path.CloseFigure();
+}
+
+static BYTE LerpByte(int a, int b, float t) {
+    t = std::clamp(t, 0.0f, 1.0f);
+    return static_cast<BYTE>(std::clamp(static_cast<int>(std::round(a + (b - a) * t)), 0, 255));
+}
+
+// Render both the main Apple Liquid Glass HUD and the origin-aware Hover Detail Popover
+static void RenderGlassHud(HWND hwnd) {
+    LLMCyclePayload payload;
+    {
+        std::lock_guard<std::mutex> lock(g_payloadMutex);
+        payload = g_currentPayload;
+    }
+
+    int width = std::clamp(g_settings.hudWidthPx, 360, 960);
+    int cardHeight = std::clamp(static_cast<int>(std::round(g_anim.heightSpring.value)), 96, 360);
+    int totalHeight = cardHeight + kPopoverCanvasReservePx;
+    float cardTopY = static_cast<float>(kPopoverCanvasReservePx);
+
+    int screenW = GetSystemMetrics(SM_CXSCREEN);
+    int screenH = GetSystemMetrics(SM_CYSCREEN);
+    int baseX = (screenW - width) / 2;
+    int baseY = screenH - totalHeight - std::clamp(g_settings.bottomOffsetPx, 16, 400);
+    int actualY = baseY + static_cast<int>(std::round(g_anim.ySpring.value));
+
+    HDC hdcScreen = GetDC(nullptr);
+    HDC hdcMem = CreateCompatibleDC(hdcScreen);
+
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = width;
+    bmi.bmiHeader.biHeight = -totalHeight;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void* pvBits = nullptr;
+    HBITMAP hbm = CreateDIBSection(hdcMem, &bmi, DIB_RGB_COLORS, &pvBits, nullptr, 0);
+    HBITMAP hbmOld = static_cast<HBITMAP>(SelectObject(hdcMem, hbm));
+
+    {
+        Graphics g(hdcMem);
+        g.SetSmoothingMode(SmoothingModeAntiAlias);
+        g.SetPixelOffsetMode(PixelOffsetModeHighQuality);
+        g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
+
+        float s = std::clamp(g_anim.scaleSpring.value, 0.85f, 1.08f);
+        float pivotX = width * 0.5f;
+        float pivotY = static_cast<float>(totalHeight);
+        g.TranslateTransform(pivotX, pivotY);
+        g.ScaleTransform(s, s);
+        g.TranslateTransform(-pivotX, -pivotY);
+
+        float alphaScale = std::clamp(g_anim.opacitySpring.value, 0.0f, 1.0f);
+        float contentAlpha = std::clamp(g_anim.contentFadeSpring.value, 0.0f, 1.0f) * alphaScale;
+
+        auto A = [alphaScale](int a) -> BYTE {
+            return static_cast<BYTE>(std::clamp(static_cast<int>(a * alphaScale), 0, 255));
+        };
+        auto CA = [contentAlpha](int a) -> BYTE {
+            return static_cast<BYTE>(std::clamp(static_cast<int>(a * contentAlpha), 0, 255));
+        };
+
+        FontFamily fontFamily(L"Segoe UI Variable Display");
+        FontFamily fallbackFamily(L"Segoe UI");
+        const FontFamily* fam = fontFamily.IsAvailable() ? &fontFamily : &fallbackFamily;
+
+        Font badgeFont(fam, 11.0f, FontStyleBold, UnitPixel);
+        Font titleFont(fam, 15.0f, FontStyleBold, UnitPixel);
+        Font bodyFont(fam, 13.0f, FontStyleRegular, UnitPixel);
+        Font optFont(fam, 12.5f, FontStyleBold, UnitPixel);
+        Font popTitleFont(fam, 12.0f, FontStyleBold, UnitPixel);
+        Font popBodyFont(fam, 12.5f, FontStyleRegular, UnitPixel);
+
+        // ====================================================================
+        // 1. Main Bottom Liquid Glass Card
+        // ====================================================================
+        RectF cardRect(2.0f, cardTopY + 2.0f, static_cast<float>(width - 4), static_cast<float>(cardHeight - 4));
+        GraphicsPath cardPath;
+        AddRoundRect(cardPath, cardRect, 20.0f);
+
+        int baseGlassAlpha = std::clamp(g_settings.glassOpacity, 120, 248);
+        LinearGradientBrush glassBrush(
+            PointF(0.0f, cardTopY),
+            PointF(0.0f, cardTopY + static_cast<float>(cardHeight)),
+            Color(A(baseGlassAlpha - 12), 34, 36, 44),
+            Color(A(baseGlassAlpha + 7), 16, 17, 23)
+        );
+        g.FillPath(&glassBrush, &cardPath);
+
+        LinearGradientBrush rimBrush(
+            PointF(0.0f, cardTopY),
+            PointF(0.0f, cardTopY + static_cast<float>(cardHeight)),
+            Color(A(150), 255, 255, 255),
+            Color(A(28), 255, 255, 255)
+        );
+        Pen rimPen(&rimBrush, 1.25f);
+        g.DrawPath(&rimPen, &cardPath);
+
+        GraphicsPath pillPath;
+        AddRoundRect(pillPath, RectF(width / 2.0f - 18.0f, cardTopY + 7.5f, 36.0f, 4.0f), 2.0f);
+        SolidBrush handleBrush(Color(A(80), 255, 255, 255));
+        g.FillPath(&handleBrush, &pillPath);
+
+        SolidBrush orbGlowBrush(Color(CA(58), 52, 199, 89));
+        g.FillEllipse(&orbGlowBrush, 18.0f, cardTopY + 19.0f, 16.0f, 16.0f);
+        SolidBrush orbCoreBrush(Color(CA(255), 48, 209, 88));
+        g.FillEllipse(&orbCoreBrush, 22.0f, cardTopY + 23.0f, 8.0f, 8.0f);
+
+        SolidBrush titleBrush(Color(CA(250), 250, 251, 254));
+        SolidBrush mutedBrush(Color(CA(182), 205, 210, 224));
+        SolidBrush accentBrush(Color(CA(240), 122, 198, 255));
+
+        std::wstring headerLine = payload.sourceApp + L"  \x00B7  " + payload.title;
+        g.DrawString(headerLine.c_str(), -1, &titleFont, PointF(42.0f, cardTopY + 17.0f), &titleBrush);
+
+        StringFormat rightFmt;
+        rightFmt.SetAlignment(StringAlignmentFar);
+        g.DrawString(payload.modelBadge.c_str(), -1, &badgeFont,
+                     RectF(width - 175.0f, cardTopY + 19.0f, 155.0f, 20.0f), &rightFmt, &accentBrush);
+
+        // Summary / Subtitle Row (with hover highlight if summary is large)
+        std::wstring shownSummary = payload.summaryShort;
+        if (payload.summaryIsLarge) {
+            shownSummary += L"  [Hover for full]";
+        }
+        SolidBrush summaryHoverBrush(Color(CA(242), 165, 215, 255));
+        g.DrawString(
+            shownSummary.c_str(),
+            -1,
+            &bodyFont,
+            RectF(20.0f, cardTopY + 44.0f, static_cast<float>(width - 40), payload.options.empty() ? 36.0f : 22.0f),
+            nullptr,
+            g_anim.hoveredSummary ? &summaryHoverBrush : &mutedBrush
+        );
+
+        if (!payload.options.empty()) {
+            int cols = 2;
+            float padX = 18.0f;
+            float gap = 10.0f;
+            float cellW = (width - padX * 2.0f - gap) / 2.0f;
+            float cellH = 34.0f;
+            float startY = cardTopY + 72.0f;
+
+            for (size_t i = 0; i < payload.options.size() && i < 4; ++i) {
+                int r = static_cast<int>(i) / cols;
+                int c = static_cast<int>(i) % cols;
+                float baseCellX = padX + c * (cellW + gap);
+                float baseCellY = startY + r * (cellH + 8.0f);
+
+                float pScale = g_anim.pillScale[i].value;
+                float hBlend = std::clamp(g_anim.pillHover[i].value, 0.0f, 1.0f);
+
+                float w = cellW * pScale;
+                float h = cellH * pScale;
+                float x = baseCellX + (cellW - w) * 0.5f;
+                float y = baseCellY + (cellH - h) * 0.5f;
+
+                RectF pillRect(x, y, w, h);
+                GraphicsPath optPath;
+                AddRoundRect(optPath, pillRect, 10.0f);
+
+                Color fillCol(
+                    CA(LerpByte(48, 118, hBlend)),
+                    LerpByte(255, 82, hBlend),
+                    LerpByte(255, 146, hBlend),
+                    255
+                );
+                Color borderCol(
+                    CA(LerpByte(54, 205, hBlend)),
+                    LerpByte(255, 138, hBlend),
+                    LerpByte(255, 198, hBlend),
+                    255
+                );
+
+                SolidBrush optFill(fillCol);
+                Pen optPen(borderCol, 1.0f);
+                g.FillPath(&optFill, &optPath);
+                g.DrawPath(&optPen, &optPath);
+
+                // Show concise subtitle on button + subtle '⋯' badge if full text is larger
+                std::wstring optLabel = std::to_wstring(i + 1) + L"   " + payload.options[i].shortSubtitle;
+                StringFormat vCenter;
+                vCenter.SetLineAlignment(StringAlignmentCenter);
+                vCenter.SetTrimming(StringTrimmingEllipsisCharacter);
+                vCenter.SetFormatFlags(StringFormatFlagsNoWrap);
+
+                float rightPad = payload.options[i].isLarge ? 32.0f : 16.0f;
+                g.DrawString(optLabel.c_str(), -1, &optFont,
+                             RectF(x + 12.0f, y, w - rightPad, h), &vCenter, &titleBrush);
+
+                if (payload.options[i].isLarge) {
+                    SolidBrush expandHintBrush(Color(CA(LerpByte(130, 240, hBlend)), 150, 210, 255));
+                    g.DrawString(L"\x22EF", -1, &optFont,
+                                 RectF(x + w - 24.0f, y, 20.0f, h), &vCenter, &expandHintBrush);
+                }
+            }
+        } else {
+            RectF inputRect(18.0f, cardTopY + 84.0f, static_cast<float>(width - 36), 34.0f);
+            GraphicsPath inputPath;
+            AddRoundRect(inputPath, inputRect, 10.0f);
+
+            SolidBrush inputFill(Color(CA(45), 255, 255, 255));
+            Pen inputPen(g_anim.replyBoxFocused
+                         ? Color(CA(190), 105, 180, 255)
+                         : Color(CA(50), 255, 255, 255), 1.0f);
+            g.FillPath(&inputFill, &inputPath);
+            g.DrawPath(&inputPen, &inputPath);
+
+            std::wstring displayReply = g_anim.replyDraft.empty()
+                ? L"Reply inline without switching windows (Enter to send, Esc to dismiss)..."
+                : (g_anim.replyDraft + L"|");
+            SolidBrush& textBrush = g_anim.replyDraft.empty() ? mutedBrush : titleBrush;
+
+            StringFormat vCenter;
+            vCenter.SetLineAlignment(StringAlignmentCenter);
+            g.DrawString(displayReply.c_str(), -1, &bodyFont,
+                         RectF(30.0f, cardTopY + 84.0f, static_cast<float>(width - 60), 34.0f), &vCenter, &textBrush);
+        }
+
+        // ====================================================================
+        // 2. Origin-Aware Apple Liquid Glass Hover Popover (for large choices/descriptions)
+        // ====================================================================
+        float popT = std::clamp(g_anim.popoverProgress.value, 0.0f, 1.0f);
+        if (popT > 0.01f && !g_anim.popoverBody.empty()) {
+            GraphicsState popState = g.Save();
+
+            float popW = static_cast<float>(width - 28);
+            float popH = static_cast<float>(kPopoverCanvasReservePx - 14);
+            float popX = 14.0f;
+            float popY = 6.0f + (1.0f - popT) * 10.0f;
+
+            // Scale from the hovered option's horizontal anchor (`transform-origin: var(--transform-origin)`)
+            float originX = std::clamp(g_anim.popoverAnchorX.value, 60.0f, static_cast<float>(width - 60));
+            float originY = popY + popH;
+            float popScale = 0.95f + 0.05f * popT; // Never scale from 0! Starts at 0.95
+
+            g.TranslateTransform(originX, originY);
+            g.ScaleTransform(popScale, popScale);
+            g.TranslateTransform(-originX, -originY);
+
+            auto PA = [popT, alphaScale](int a) -> BYTE {
+                return static_cast<BYTE>(std::clamp(static_cast<int>(a * popT * alphaScale), 0, 255));
+            };
+
+            RectF popRect(popX, popY, popW, popH);
+            GraphicsPath popPath;
+            AddRoundRect(popPath, popRect, 16.0f);
+
+            // Darker/thicker elevated glass material for floating popover hierarchy
+            LinearGradientBrush popGlass(
+                PointF(0.0f, popY),
+                PointF(0.0f, popY + popH),
+                Color(PA(242), 28, 31, 40),
+                Color(PA(250), 15, 17, 23)
+            );
+            g.FillPath(&popGlass, &popPath);
+
+            LinearGradientBrush popRim(
+                PointF(0.0f, popY),
+                PointF(0.0f, popY + popH),
+                Color(PA(165), 160, 210, 255),
+                Color(PA(45), 255, 255, 255)
+            );
+            Pen popRimPen(&popRim, 1.25f);
+            g.DrawPath(&popRimPen, &popPath);
+
+            SolidBrush popHeadingBrush(Color(PA(245), 125, 200, 255));
+            SolidBrush popBodyBrush(Color(PA(248), 245, 247, 252));
+
+            g.DrawString(g_anim.popoverHeading.c_str(), -1, &popTitleFont,
+                         PointF(popX + 14.0f, popY + 10.0f), &popHeadingBrush);
+
+            StringFormat wrapFmt;
+            wrapFmt.SetTrimming(StringTrimmingEllipsisWord);
+            g.DrawString(g_anim.popoverBody.c_str(), -1, &popBodyFont,
+                         RectF(popX + 14.0f, popY + 30.0f, popW - 28.0f, popH - 38.0f),
+                         &wrapFmt, &popBodyBrush);
+
+            g.Restore(popState);
+        }
+    }
+
+    POINT ptSrc = {0, 0};
+    POINT ptDst = {baseX, actualY};
+    SIZE wndSize = {width, totalHeight};
+    BLENDFUNCTION blend = {};
+    blend.BlendOp = AC_SRC_OVER;
+    blend.SourceConstantAlpha = 255;
+    blend.AlphaFormat = AC_SRC_ALPHA;
+
+    UpdateLayeredWindow(hwnd, hdcScreen, &ptDst, &wndSize, hdcMem, &ptSrc, 0, &blend, ULW_ALPHA);
+
+    SelectObject(hdcMem, hbmOld);
+    DeleteObject(hbm);
+    DeleteDC(hdcMem);
+    ReleaseDC(nullptr, hdcScreen);
+}
+
+static int HitTestOption(int clientX, int clientY, float* outCenterX = nullptr) {
+    LLMCyclePayload payload;
+    {
+        std::lock_guard<std::mutex> lock(g_payloadMutex);
+        payload = g_currentPayload;
+    }
+    if (payload.options.empty()) return -1;
+
+    int width = std::clamp(g_settings.hudWidthPx, 360, 960);
+    int cols = 2;
+    float padX = 18.0f;
+    float gap = 10.0f;
+    float cellW = (width - padX * 2.0f - gap) / 2.0f;
+    float cellH = 34.0f;
+    float startY = static_cast<float>(kPopoverCanvasReservePx) + 72.0f;
+
+    for (size_t i = 0; i < payload.options.size() && i < 4; ++i) {
+        int r = static_cast<int>(i) / cols;
+        int c = static_cast<int>(i) % cols;
+        float x = padX + c * (cellW + gap);
+        float y = startY + r * (cellH + 8.0f);
+        if (clientX >= (x - 4.0f) && clientX <= (x + cellW + 4.0f) &&
+            clientY >= (y - 3.0f) && clientY <= (y + cellH + 3.0f)) {
+            if (outCenterX) *outCenterX = x + cellW * 0.5f;
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+static bool HitTestSummaryRow(int clientX, int clientY) {
+    int width = std::clamp(g_settings.hudWidthPx, 360, 960);
+    float topY = static_cast<float>(kPopoverCanvasReservePx) + 42.0f;
+    return (clientX >= 18 && clientX <= width - 18 && clientY >= topY && clientY <= topY + 28.0f);
+}
+
+static void EnsureAnimationLoopRunning(HWND hwnd) {
+    LONGLONG now = 0;
+    QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&now));
+    if (g_anim.lastFrameQpc == 0) {
+        g_anim.lastFrameQpc = now;
+    }
+    SetTimer(hwnd, TIMER_SPRING_FRAME, 8, nullptr);
+}
+
+static void StartDismissAnimation(HWND hwnd, float releaseVelocityY = 0.0f) {
+    g_anim.dismissing = true;
+    g_anim.yZeta = 1.0f;
+    g_anim.popoverActive = false;
+    g_anim.popoverProgress.target = 0.0f;
+    if (IsReducedMotionEnabled()) {
+        g_anim.ySpring.target = 0.0f;
+        g_anim.scaleSpring.target = 1.0f;
+        g_anim.opacitySpring.target = 0.0f;
+    } else {
+        g_anim.ySpring.target = 86.0f;
+        g_anim.scaleSpring.target = 0.95f;
+        g_anim.opacitySpring.target = 0.0f;
+        if (std::fabs(releaseVelocityY) > 10.0f) {
+            g_anim.ySpring.velocity = releaseVelocityY;
+        }
+    }
+    EnsureAnimationLoopRunning(hwnd);
+}
+
+static void StepSpringAnimation(HWND hwnd) {
+    LONGLONG now = 0;
+    QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&now));
+    float dt = static_cast<float>(now - g_anim.lastFrameQpc) / static_cast<float>(g_anim.qpcFreq);
+    g_anim.lastFrameQpc = now;
+    dt = std::clamp(dt, 0.001f, 0.033f);
+
+    bool anyMoving = false;
+
+    if (!g_anim.isDragging) {
+        if (g_anim.ySpring.Step(dt, 21.5f, g_anim.yZeta)) anyMoving = true;
+        if (g_anim.scaleSpring.Step(dt, 24.0f, 1.0f)) anyMoving = true;
+    } else {
+        anyMoving = true;
+    }
+
+    if (g_anim.opacitySpring.Step(dt, 24.0f, 1.0f)) anyMoving = true;
+    if (g_anim.heightSpring.Step(dt, 23.0f, 1.0f)) anyMoving = true;
+    if (g_anim.contentFadeSpring.Step(dt, 26.0f, 1.0f)) anyMoving = true;
+    if (g_anim.popoverProgress.Step(dt, 30.0f, 1.0f)) anyMoving = true;
+    if (g_anim.popoverAnchorX.Step(dt, 32.0f, 1.0f)) anyMoving = true;
+
+    for (int i = 0; i < 4; ++i) {
+        if (g_anim.pillScale[i].Step(dt, 34.0f, 0.92f)) anyMoving = true;
+        if (g_anim.pillHover[i].Step(dt, 28.0f, 1.0f)) anyMoving = true;
+    }
+
+    RenderGlassHud(hwnd);
+
+    if (!anyMoving && !g_anim.isDragging) {
+        KillTimer(hwnd, TIMER_SPRING_FRAME);
+        g_anim.lastFrameQpc = 0;
+
+        if (g_anim.dismissing) {
+            g_anim.visible = false;
+            g_anim.dismissing = false;
+            SecureZeroMemory(g_anim.replyDraft.data(), g_anim.replyDraft.size() * sizeof(wchar_t));
+            g_anim.replyDraft.clear();
+            if (g_settings.enableHotkeys) {
+                for (int k = 1; k <= 4; ++k) UnregisterHotKey(hwnd, 2000 + k);
+            }
+            ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+}
+
+static LRESULT CALLBACK GlassHudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_APP_SHOW_LLM_HUD: {
+            float targetH = 132.0f;
+            {
+                std::lock_guard<std::mutex> lock(g_payloadMutex);
+                targetH = static_cast<float>(ComputeTargetHudHeight(g_currentPayload));
+            }
+
+            bool reduced = IsReducedMotionEnabled();
+            if (!g_anim.visible) {
+                g_anim.ySpring.Reset(reduced ? 0.0f : 68.0f, 0.0f, 0.0f);
+                g_anim.scaleSpring.Reset(reduced ? 1.0f : 0.95f, 1.0f, 0.0f);
+                g_anim.opacitySpring.Reset(0.0f, 1.0f, 0.0f);
+                g_anim.heightSpring.Reset(targetH, targetH, 0.0f);
+                g_anim.contentFadeSpring.Reset(1.0f, 1.0f, 0.0f);
+            } else {
+                g_anim.ySpring.target = 0.0f;
+                g_anim.scaleSpring.target = 1.0f;
+                g_anim.opacitySpring.target = 1.0f;
+                g_anim.heightSpring.target = targetH;
+                g_anim.contentFadeSpring.Reset(0.68f, 1.0f, 0.0f);
+            }
+
+            QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&g_anim.showQpc));
+            g_anim.yZeta = 1.0f;
+            g_anim.visible = true;
+            g_anim.dismissing = false;
+            g_anim.hoveredOption = -1;
+            g_anim.hoveredSummary = false;
+            g_anim.popoverActive = false;
+            g_anim.popoverProgress.Reset(0.0f, 0.0f);
+            g_anim.pressedOption = -1;
+            g_anim.replyDraft.clear();
+            for (int i = 0; i < 4; ++i) {
+                g_anim.pillScale[i].target = 1.0f;
+                g_anim.pillHover[i].target = 0.0f;
+            }
+
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            ApplyAppleGlassBackdrop(hwnd);
+
+            if (g_settings.enableHotkeys) {
+                for (int k = 1; k <= 4; ++k) {
+                    RegisterHotKey(hwnd, 2000 + k, MOD_ALT | MOD_NOREPEAT, '0' + k);
+                }
+            }
+
+            g_anim.lastFrameQpc = 0;
+            EnsureAnimationLoopRunning(hwnd);
+            if (g_settings.autoDismissSeconds > 0) {
+                SetTimer(hwnd, TIMER_AUTO_DISMISS, std::clamp(g_settings.autoDismissSeconds, 3, 300) * 1000, nullptr);
+            }
+            return 0;
+        }
+
+        case WM_TIMER: {
+            if (wParam == TIMER_SPRING_FRAME) {
+                StepSpringAnimation(hwnd);
+            } else if (wParam == TIMER_AUTO_DISMISS) {
+                KillTimer(hwnd, TIMER_AUTO_DISMISS);
+                if (!g_anim.isDragging && !g_anim.replyBoxFocused && !g_anim.popoverActive) {
+                    StartDismissAnimation(hwnd);
+                }
+            }
+            return 0;
+        }
+
+        case WM_HOTKEY: {
+            if (g_anim.IsWithinClickjackGraceWindow()) return 0;
+            int idx = static_cast<int>(wParam) - 2001;
+            std::wstring chosen;
+            {
+                std::lock_guard<std::mutex> lock(g_payloadMutex);
+                if (idx >= 0 && idx < static_cast<int>(g_currentPayload.options.size())) {
+                    chosen = g_currentPayload.options[idx].fullText;
+                }
+            }
+            if (!chosen.empty()) {
+                SendAnswerToLLM(chosen, false);
+                StartDismissAnimation(hwnd);
+            }
+            return 0;
+        }
+
+        case WM_MOUSEACTIVATE:
+            return MA_NOACTIVATE;
+
+        case WM_LBUTTONDOWN: {
+            if (g_anim.isDragging || g_anim.IsWithinClickjackGraceWindow()) return 0;
+            int x = GET_X_LPARAM(lParam);
+            int y = GET_Y_LPARAM(lParam);
+            if (y < kPopoverCanvasReservePx) return 0; // Ignore clicks in transparent upper area
+
+            int optIdx = HitTestOption(x, y);
+            if (optIdx >= 0) {
+                g_anim.pressedOption = optIdx;
+                g_anim.pillScale[optIdx].target = 0.965f;
+                EnsureAnimationLoopRunning(hwnd);
+                return 0;
+            }
+
+            bool hasOptions = false;
+            {
+                std::lock_guard<std::mutex> lock(g_payloadMutex);
+                hasOptions = !g_currentPayload.options.empty();
+            }
+            int cardRelativeY = y - kPopoverCanvasReservePx;
+            if (!hasOptions && cardRelativeY >= 80 && cardRelativeY <= 122) {
+                g_anim.replyBoxFocused = true;
+                SetForegroundWindow(hwnd);
+                SetFocus(hwnd);
+                RenderGlassHud(hwnd);
+                return 0;
+            }
+
+            SetCapture(hwnd);
+            g_anim.isDragging = true;
+            g_anim.popoverActive = false;
+            g_anim.popoverProgress.target = 0.0f;
+            GetCursorPos(&g_anim.dragStartScreenPt);
+            g_anim.dragStartOffsetY = g_anim.ySpring.value;
+            g_anim.ySpring.velocity = 0.0f;
+            g_anim.historyCount = 0;
+            g_anim.PushPointerSample(static_cast<float>(g_anim.dragStartScreenPt.y));
+            EnsureAnimationLoopRunning(hwnd);
+            return 0;
+        }
+
+        case WM_MOUSEMOVE: {
+            int x = GET_X_LPARAM(lParam);
+            int y = GET_Y_LPARAM(lParam);
+
+            if (g_anim.isDragging) {
+                POINT pt;
+                GetCursorPos(&pt);
+                g_anim.PushPointerSample(static_cast<float>(pt.y));
+
+                float deltaY = static_cast<float>(pt.y - g_anim.dragStartScreenPt.y);
+                float rawOffset = g_anim.dragStartOffsetY + deltaY;
+                if (rawOffset < 0.0f) {
+                    g_anim.ySpring.value = -RubberBand(-rawOffset, 120.0f);
+                } else {
+                    g_anim.ySpring.value = rawOffset;
+                }
+                RenderGlassHud(hwnd);
+                return 0;
+            }
+
+            float optCenterX = 270.0f;
+            int hoveredOpt = HitTestOption(x, y, &optCenterX);
+            bool onSummary = (hoveredOpt < 0) && HitTestSummaryRow(x, y);
+
+            if (hoveredOpt != g_anim.hoveredOption || onSummary != g_anim.hoveredSummary) {
+                g_anim.hoveredOption = hoveredOpt;
+                g_anim.hoveredSummary = onSummary;
+
+                for (int i = 0; i < 4; ++i) {
+                    g_anim.pillHover[i].target = (i == hoveredOpt) ? 1.0f : 0.0f;
+                }
+
+                // Update origin-aware full-text hover popover when hovering a large option or large summary
+                LLMCyclePayload payload;
+                {
+                    std::lock_guard<std::mutex> lock(g_payloadMutex);
+                    payload = g_currentPayload;
+                }
+
+                if (hoveredOpt >= 0 && hoveredOpt < static_cast<int>(payload.options.size()) &&
+                    payload.options[hoveredOpt].isLarge) {
+                    if (!g_anim.popoverActive) {
+                        g_anim.popoverAnchorX.Reset(optCenterX, optCenterX);
+                    } else {
+                        g_anim.popoverAnchorX.target = optCenterX; // Instant neighbour transition!
+                    }
+                    g_anim.popoverActive = true;
+                    g_anim.popoverHeading = L"Option " + std::to_wstring(hoveredOpt + 1) + L" \x00B7 " +
+                                            payload.options[hoveredOpt].shortSubtitle;
+                    g_anim.popoverBody = payload.options[hoveredOpt].fullText;
+                    g_anim.popoverProgress.target = 1.0f;
+                } else if (onSummary && payload.summaryIsLarge) {
+                    float centerX = std::clamp(g_settings.hudWidthPx, 360, 960) * 0.5f;
+                    if (!g_anim.popoverActive) {
+                        g_anim.popoverAnchorX.Reset(centerX, centerX);
+                    } else {
+                        g_anim.popoverAnchorX.target = centerX;
+                    }
+                    g_anim.popoverActive = true;
+                    g_anim.popoverHeading = payload.sourceApp + L" \x00B7 Full Cycle Description";
+                    g_anim.popoverBody = payload.summaryFull;
+                    g_anim.popoverProgress.target = 1.0f;
+                } else {
+                    g_anim.popoverActive = false;
+                    g_anim.popoverProgress.target = 0.0f;
+                }
+
+                EnsureAnimationLoopRunning(hwnd);
+            }
+
+            TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, hwnd, 0};
+            TrackMouseEvent(&tme);
+            return 0;
+        }
+
+        case WM_MOUSELEAVE: {
+            if (g_anim.hoveredOption != -1 || g_anim.pressedOption != -1 ||
+                g_anim.hoveredSummary || g_anim.popoverActive) {
+                g_anim.hoveredOption = -1;
+                g_anim.hoveredSummary = false;
+                g_anim.pressedOption = -1;
+                g_anim.popoverActive = false;
+                g_anim.popoverProgress.target = 0.0f;
+                for (int i = 0; i < 4; ++i) {
+                    g_anim.pillHover[i].target = 0.0f;
+                    g_anim.pillScale[i].target = 1.0f;
+                }
+                EnsureAnimationLoopRunning(hwnd);
+            }
+            return 0;
+        }
+
+        case WM_LBUTTONUP: {
+            int x = GET_X_LPARAM(lParam);
+            int y = GET_Y_LPARAM(lParam);
+
+            if (g_anim.pressedOption >= 0) {
+                int releasedIdx = HitTestOption(x, y);
+                int chosenIdx = g_anim.pressedOption;
+                g_anim.pressedOption = -1;
+                g_anim.pillScale[chosenIdx].target = 1.0f;
+
+                if (releasedIdx == chosenIdx) {
+                    std::wstring chosen;
+                    {
+                        std::lock_guard<std::mutex> lock(g_payloadMutex);
+                        if (chosenIdx < static_cast<int>(g_currentPayload.options.size())) {
+                            chosen = g_currentPayload.options[chosenIdx].fullText;
+                        }
+                    }
+                    if (!chosen.empty()) {
+                        SendAnswerToLLM(chosen, false);
+                        StartDismissAnimation(hwnd);
+                        return 0;
+                    }
+                }
+                EnsureAnimationLoopRunning(hwnd);
+                return 0;
+            }
+
+            if (g_anim.isDragging) {
+                ReleaseCapture();
+                g_anim.isDragging = false;
+                float releaseVel = g_anim.ComputeReleaseVelocityPxPerSec();
+                g_anim.ySpring.velocity = releaseVel;
+
+                float projectedY = g_anim.ySpring.value + ProjectMomentum(releaseVel, 0.994f);
+                if ((projectedY > 42.0f || releaseVel > 180.0f) && releaseVel >= -20.0f) {
+                    StartDismissAnimation(hwnd, releaseVel);
+                } else {
+                    g_anim.yZeta = IsReducedMotionEnabled() ? 1.0f : 0.82f;
+                    g_anim.ySpring.target = 0.0f;
+                    EnsureAnimationLoopRunning(hwnd);
+                }
+            }
+            return 0;
+        }
+
+        case WM_RBUTTONUP: {
+            int x = GET_X_LPARAM(lParam);
+            int y = GET_Y_LPARAM(lParam);
+            int optIdx = HitTestOption(x, y);
+            if (optIdx >= 0) {
+                std::wstring chosen;
+                {
+                    std::lock_guard<std::mutex> lock(g_payloadMutex);
+                    if (optIdx < static_cast<int>(g_currentPayload.options.size())) {
+                        chosen = g_currentPayload.options[optIdx].fullText;
+                    }
+                }
+                if (!chosen.empty()) {
+                    SendAnswerToLLM(chosen, true);
+                    StartDismissAnimation(hwnd);
+                }
+            } else if (y >= kPopoverCanvasReservePx) {
+                StartDismissAnimation(hwnd);
+            }
+            return 0;
+        }
+
+        case WM_CHAR: {
+            if (!g_anim.replyBoxFocused) break;
+            wchar_t ch = static_cast<wchar_t>(wParam);
+            if (ch == VK_BACK) {
+                if (!g_anim.replyDraft.empty()) g_anim.replyDraft.pop_back();
+                RenderGlassHud(hwnd);
+            } else if (ch == VK_RETURN) {
+                if (!g_anim.replyDraft.empty()) {
+                    std::wstring toSend = g_anim.replyDraft;
+                    g_anim.replyBoxFocused = false;
+                    SendAnswerToLLM(toSend, false);
+                    StartDismissAnimation(hwnd);
+                }
+            } else if (ch == VK_ESCAPE) {
+                g_anim.replyBoxFocused = false;
+                StartDismissAnimation(hwnd);
+            } else if (ch >= 32 && g_anim.replyDraft.size() < 512) {
+                g_anim.replyDraft.push_back(ch);
+                RenderGlassHud(hwnd);
+            }
+            return 0;
+        }
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static DWORD WINAPI HudHostThreadProc(LPVOID) {
+    GdiplusStartupInput gdiplusStartupInput;
+    GdiplusStartup(&g_gdiplusToken, &gdiplusStartupInput, nullptr);
+    g_anim.InitSprings();
+
+    WNDCLASSEXW wc = {};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = GlassHudWndProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.lpszClassName = kHudClassName;
+    RegisterClassExW(&wc);
+
+    g_hudHwnd = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        kHudClassName,
+        L"LLM Liquid Glass HUD",
+        WS_POPUP,
+        0, 0, std::clamp(g_settings.hudWidthPx, 360, 960), 140 + kPopoverCanvasReservePx,
+        nullptr, nullptr, wc.hInstance, nullptr
+    );
+
+    std::thread pipeListener([]() {
+        PSECURITY_DESCRIPTOR pSD = nullptr;
+        bool hasSD = CreateOwnerOnlySecurityDescriptor(&pSD);
+        SECURITY_ATTRIBUTES sa = {};
+        sa.nLength = sizeof(sa);
+        sa.lpSecurityDescriptor = hasSD ? pSD : nullptr;
+        sa.bInheritHandle = FALSE;
+
+        while (!g_shuttingDown.load()) {
+            HANDLE hPipe = CreateNamedPipeW(
+                kPipeName,
+                PIPE_ACCESS_INBOUND,
+                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                4,
+                8192, 8192, 500,
+                hasSD ? &sa : nullptr
+            );
+            if (hPipe == INVALID_HANDLE_VALUE) {
+                Sleep(500);
+                continue;
+            }
+            BOOL connected = ConnectNamedPipe(hPipe, nullptr)
+                ? TRUE
+                : (GetLastError() == ERROR_PIPE_CONNECTED);
+            if (connected && !g_shuttingDown.load()) {
+                wchar_t buffer[4096] = {};
+                DWORD bytesRead = 0;
+                if (ReadFile(hPipe, buffer, sizeof(buffer) - sizeof(wchar_t), &bytesRead, nullptr) &&
+                    bytesRead >= sizeof(wchar_t)) {
+                    size_t charCount = std::min<size_t>(bytesRead / sizeof(wchar_t), 4095);
+                    buffer[charCount] = L'\0';
+                    LLMCyclePayload parsed = ParsePipeMessage(std::wstring(buffer, charCount));
+                    {
+                        std::lock_guard<std::mutex> lock(g_payloadMutex);
+                        g_currentPayload = parsed;
+                    }
+                    if (g_hudHwnd) {
+                        PostMessageW(g_hudHwnd, WM_APP_SHOW_LLM_HUD, 0, 0);
+                    }
+                }
+            }
+            DisconnectNamedPipe(hPipe);
+            CloseHandle(hPipe);
+        }
+
+        if (pSD) LocalFree(pSD);
+    });
+    pipeListener.detach();
+
+    MSG msg;
+    while (!g_shuttingDown.load() && GetMessageW(&msg, nullptr, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    if (g_hudHwnd) {
+        DestroyWindow(g_hudHwnd);
+        g_hudHwnd = nullptr;
+    }
+    GdiplusShutdown(g_gdiplusToken);
+    return 0;
+}
+
+using Shell_NotifyIconW_t = BOOL(WINAPI*)(DWORD dwMessage, PNOTIFYICONDATAW lpData);
+static Shell_NotifyIconW_t g_origShellNotifyIconW = nullptr;
+
+static std::wstring GetCurrentExeLabel() {
+    wchar_t path[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    const wchar_t* filename = PathFindFileNameW(path);
+    if (StrStrIW(filename, L"Antigravity")) return L"Antigravity";
+    if (StrStrIW(filename, L"Cursor")) return L"Cursor";
+    if (StrStrIW(filename, L"Code")) return L"VS Code";
+    if (StrStrIW(filename, L"Claude")) return L"Claude";
+    if (StrStrIW(filename, L"WindowsTerminal")) return L"Terminal Agent";
+    return filename;
+}
+
+BOOL WINAPI Hooked_Shell_NotifyIconW(DWORD dwMessage, PNOTIFYICONDATAW lpData) {
+    if (g_settings.interceptToasts && lpData && (dwMessage == NIM_ADD || dwMessage == NIM_MODIFY)) {
+        if ((lpData->uFlags & NIF_INFO) && lpData->szInfo[0] != L'\0') {
+            LLMCyclePayload payload;
+            payload.sourceApp = GetCurrentExeLabel();
+            payload.modelBadge = L"Agent Ready";
+            payload.title = (lpData->szInfoTitle[0] != L'\0')
+                ? SanitizeUntrustedString(lpData->szInfoTitle, 96)
+                : L"Cycle Finished";
+            ExtractOptionsFromText(
+                lpData->szInfo,
+                payload.summaryShort,
+                payload.summaryFull,
+                payload.summaryIsLarge,
+                payload.options
+            );
+            payload.targetWindow = lpData->hWnd;
+            DispatchToGlassHUD(payload);
+        }
+    }
+    return g_origShellNotifyIconW(dwMessage, lpData);
+}
+
+using FlashWindowEx_t = BOOL(WINAPI*)(PFLASHWINFO pfwi);
+static FlashWindowEx_t g_origFlashWindowEx = nullptr;
+
+BOOL WINAPI Hooked_FlashWindowEx(PFLASHWINFO pfwi) {
+    if (g_settings.interceptToasts && pfwi && pfwi->hwnd && (pfwi->dwFlags & (FLASHW_TRAY | FLASHW_ALL))) {
+        if (GetForegroundWindow() != pfwi->hwnd && !g_isExplorerHost) {
+            wchar_t winTitle[256] = {};
+            GetWindowTextW(pfwi->hwnd, winTitle, 255);
+
+            LLMCyclePayload payload;
+            payload.sourceApp = GetCurrentExeLabel();
+            payload.modelBadge = L"Cycle Complete";
+            payload.title = winTitle[0] ? SanitizeUntrustedString(winTitle, 96) : L"LLM Task Complete";
+            payload.summaryShort = L"The agent finished its cycle and is waiting for your input.";
+            payload.summaryFull = payload.summaryShort;
+            payload.summaryIsLarge = false;
+            payload.targetWindow = pfwi->hwnd;
+            DispatchToGlassHUD(payload);
+        }
+    }
+    return g_origFlashWindowEx(pfwi);
+}
+
+static void LoadSettings() {
+    g_settings.glassOpacity = Wh_GetIntSetting(L"glassOpacity");
+    g_settings.bottomOffsetPx = Wh_GetIntSetting(L"bottomOffsetPx");
+    g_settings.hudWidthPx = Wh_GetIntSetting(L"hudWidthPx");
+    g_settings.autoDismissSeconds = Wh_GetIntSetting(L"autoDismissSeconds");
+    g_settings.enableHotkeys = Wh_GetIntSetting(L"enableHotkeys") != 0;
+    g_settings.interceptToasts = Wh_GetIntSetting(L"interceptToasts") != 0;
+}
+
+BOOL Wh_ModInit() {
+    LoadSettings();
+
+    wchar_t exePath[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    if (StrStrIW(PathFindFileNameW(exePath), L"explorer.exe")) {
+        g_isExplorerHost = true;
+        g_pipeThread = CreateThread(nullptr, 0, HudHostThreadProc, nullptr, 0, nullptr);
+    }
+
+    HMODULE hShell32 = LoadLibraryW(L"shell32.dll");
+    if (hShell32) {
+        auto pShellNotify = reinterpret_cast<void*>(GetProcAddress(hShell32, "Shell_NotifyIconW"));
+        if (pShellNotify) {
+            Wh_SetFunctionHook(pShellNotify, reinterpret_cast<void*>(Hooked_Shell_NotifyIconW),
+                               reinterpret_cast<void**>(&g_origShellNotifyIconW));
+        }
+    }
+
+    HMODULE hUser32 = LoadLibraryW(L"user32.dll");
+    if (hUser32) {
+        auto pFlashWindowEx = reinterpret_cast<void*>(GetProcAddress(hUser32, "FlashWindowEx"));
+        if (pFlashWindowEx) {
+            Wh_SetFunctionHook(pFlashWindowEx, reinterpret_cast<void*>(Hooked_FlashWindowEx),
+                               reinterpret_cast<void**>(&g_origFlashWindowEx));
+        }
+    }
+
+    return TRUE;
+}
+
+void Wh_ModSettingsChanged() {
+    LoadSettings();
+    if (g_isExplorerHost && g_hudHwnd && g_anim.visible) {
+        ApplyAppleGlassBackdrop(g_hudHwnd);
+        RenderGlassHud(g_hudHwnd);
+    }
+}
+
+void Wh_ModUninit() {
+    g_shuttingDown.store(true);
+    if (g_hudHwnd) {
+        PostMessageW(g_hudHwnd, WM_CLOSE, 0, 0);
+    }
+    HANDLE hWake = CreateFileW(
+        kPipeName,
+        GENERIC_WRITE,
+        0,
+        nullptr,
+        OPEN_EXISTING,
+        SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+        nullptr
+    );
+    if (hWake != INVALID_HANDLE_VALUE) {
+        CloseHandle(hWake);
+    }
+    if (g_pipeThread) {
+        WaitForSingleObject(g_pipeThread, 1500);
+        CloseHandle(g_pipeThread);
+    }
+}

@@ -1,0 +1,655 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
+  <style>
+    :root {
+      --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+    }
+
+    * {
+      box-sizing: border-box;
+      user-select: none;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI Variable Display", system-ui, sans-serif;
+    }
+
+    .apple-liquid-glass {
+      background: linear-gradient(
+        180deg,
+        rgba(38, 40, 48, 0.78) 0%,
+        rgba(18, 19, 25, 0.88) 100%
+      );
+      backdrop-filter: blur(28px) saturate(190%);
+      -webkit-backdrop-filter: blur(28px) saturate(190%);
+      box-shadow:
+        0 22px 48px -12px rgba(0, 0, 0, 0.62),
+        0 4px 14px -2px rgba(0, 0, 0, 0.35),
+        inset 0 1.25px 0 0 rgba(255, 255, 255, 0.44),
+        inset 0 -1px 0 0 rgba(255, 255, 255, 0.08),
+        0 0 0 1px rgba(255, 255, 255, 0.12);
+      transform-origin: 50% 100%;
+      will-change: transform, opacity;
+    }
+
+    /* Darker/heavier elevated glass material for the hover detail popover */
+    .apple-popover-glass {
+      background: linear-gradient(
+        180deg,
+        rgba(28, 31, 40, 0.94) 0%,
+        rgba(14, 16, 22, 0.97) 100%
+      );
+      backdrop-filter: blur(32px) saturate(200%);
+      -webkit-backdrop-filter: blur(32px) saturate(200%);
+      box-shadow:
+        0 20px 42px -8px rgba(0, 0, 0, 0.72),
+        inset 0 1.25px 0 0 rgba(160, 210, 255, 0.55),
+        0 0 0 1px rgba(135, 195, 255, 0.24);
+      will-change: transform, opacity;
+    }
+
+    .glass-pill {
+      background: linear-gradient(
+        180deg,
+        rgba(255, 255, 255, 0.12) 0%,
+        rgba(255, 255, 255, 0.06) 100%
+      );
+      box-shadow:
+        inset 0 1px 0 0 rgba(255, 255, 255, 0.22),
+        0 0 0 1px rgba(255, 255, 255, 0.10);
+      transition:
+        transform 140ms var(--ease-out),
+        background 150ms ease,
+        box-shadow 150ms ease;
+    }
+
+    @media (hover: hover) and (pointer: fine) {
+      .glass-pill:hover {
+        background: linear-gradient(
+          180deg,
+          rgba(94, 158, 255, 0.28) 0%,
+          rgba(56, 116, 246, 0.18) 100%
+        );
+        box-shadow:
+          inset 0 1px 0 0 rgba(165, 208, 255, 0.48),
+          0 0 0 1px rgba(110, 175, 255, 0.38),
+          0 6px 16px -4px rgba(45, 115, 255, 0.28);
+      }
+    }
+
+    .glass-pill:active,
+    .glass-pill.pressed {
+      transform: scale(0.965);
+    }
+
+    .control-btn {
+      transition:
+        transform 140ms var(--ease-out),
+        background-color 140ms ease,
+        border-color 140ms ease;
+    }
+    .control-btn:active {
+      transform: scale(0.97);
+    }
+
+    .hud-content-swap {
+      transition:
+        opacity 180ms var(--ease-out),
+        filter 180ms var(--ease-out),
+        transform 180ms var(--ease-out);
+    }
+    .hud-content-swap.swapping {
+      opacity: 0.35;
+      filter: blur(2.5px);
+      transform: scale(0.985);
+    }
+
+    .desktop-stage {
+      background:
+        radial-gradient(120% 90% at 18% 20%, rgba(56, 128, 255, 0.32) 0%, transparent 55%),
+        radial-gradient(100% 85% at 82% 75%, rgba(168, 85, 247, 0.28) 0%, transparent 58%),
+        radial-gradient(80% 60% at 50% 95%, rgba(16, 185, 129, 0.20) 0%, transparent 60%),
+        linear-gradient(160deg, #0b0e17 0%, #131826 52%, #0d111c 100%);
+    }
+  </style>
+</head>
+<body class="bg-transparent text-[var(--foreground)] p-2">
+  <div class="desktop-stage relative rounded-2xl border border-white/15 overflow-hidden shadow-2xl p-4 flex flex-col justify-between" style="height: 465px;">
+    
+    <!-- Top Controls Bar -->
+    <div class="flex flex-wrap items-center justify-between gap-2 z-20 bg-black/40 backdrop-blur-md border border-white/10 rounded-xl px-3.5 py-2">
+      <div class="flex items-center gap-2">
+        <span class="inline-block w-2 h-2 rounded-full bg-emerald-400 shadow-[0_0_8px_#34d399]"></span>
+        <span class="text-xs font-semibold tracking-tight text-white/90">LLM Liquid Glass HUD v1.3 · Hover Popover Demo</span>
+        <span id="statusToast" class="text-xs text-sky-300/90 font-medium ml-2 opacity-0 transition-opacity duration-200">
+          ✓ Sent in background
+        </span>
+      </div>
+      <div class="flex items-center gap-1.5">
+        <button id="btnModeOptions" onclick="switchScenario('options')" class="control-btn px-2.5 py-1 rounded-lg text-xs font-medium bg-white/20 text-white border border-white/20">
+          1. Large Options
+        </button>
+        <button id="btnModeSummary" onclick="switchScenario('summary')" class="control-btn px-2.5 py-1 rounded-lg text-xs font-medium bg-white/5 text-white/75 hover:bg-white/10 border border-white/10">
+          2. Large Summary
+        </button>
+        <button id="btnSlowMo" onclick="toggleSlowMo()" class="control-btn px-2.5 py-1 rounded-lg text-xs font-medium bg-amber-500/20 text-amber-200 border border-amber-400/30 hover:bg-amber-500/30">
+          0.25× Slow-Mo: Off
+        </button>
+        <button onclick="retriggerSpring()" class="control-btn px-2.5 py-1 rounded-lg text-xs font-medium bg-sky-500/25 text-sky-200 border border-sky-400/30 hover:bg-sky-500/35">
+          ↻ Replay
+        </button>
+      </div>
+    </div>
+
+    <!-- Simulated Active Coding Window -->
+    <div class="mx-auto w-full max-w-[515px] rounded-xl bg-black/35 border border-white/10 p-2.5 backdrop-blur-sm text-xs text-white/60 font-mono">
+      <div class="flex items-center justify-between mb-1 pb-1 border-b border-white/10">
+        <span class="text-white/80 font-sans font-medium flex items-center gap-1.5">
+          <span class="w-2 h-2 rounded-full bg-sky-400"></span>
+          Hover any button with <span class="text-sky-300 font-bold">⋯</span> or the description to inspect full text
+        </span>
+        <span id="springTelemetry" class="text-emerald-300 font-mono text-xs">y: 0.0px · scale: 1.000</span>
+      </div>
+      <div id="codeLog" class="truncate text-white/70">
+        &gt; Long choices automatically show their subtitle on the button and expand on hover.
+      </div>
+    </div>
+
+    <!-- Floating Bottom Apple Liquid Glass HUD + Origin-Aware Hover Popover -->
+    <div class="relative flex flex-col items-center justify-end pb-7 z-30">
+      
+      <!-- Origin-Aware Hover Detail Popover (Springs open above the HUD) -->
+      <div
+        id="hoverPopover"
+        class="apple-popover-glass pointer-events-none w-full max-w-[495px] rounded-2xl px-4 py-3 mb-2 opacity-0"
+        style="transform: translateY(10px) scale(0.95);"
+      >
+        <div class="flex items-center justify-between mb-1">
+          <span id="popoverHeading" class="text-xs font-semibold text-sky-300 tracking-tight">Option 1 · Zero-Downtime Expand</span>
+          <span class="text-xs text-white/45 font-mono">Full LLM Output</span>
+        </div>
+        <p id="popoverBody" class="text-xs text-white/95 leading-relaxed">
+          Zero-Downtime Expand &amp; Contract — Creates shadow columns with dual-write triggers, backfills 1.4M rows in 10k batches, and swaps views atomically with zero lock contention.
+        </p>
+      </div>
+
+      <!-- Main HUD Bar -->
+      <div
+        id="glassHud"
+        class="apple-liquid-glass w-full max-w-[515px] rounded-[20px] px-4 pt-2 pb-3.5 cursor-grab active:cursor-grabbing"
+      >
+        <div class="w-9 h-1 rounded-full bg-white/30 mx-auto mb-2"></div>
+
+        <div id="hudContentWrap" class="hud-content-swap">
+          <!-- Header -->
+          <div class="flex items-center justify-between gap-2 mb-1">
+            <div class="flex items-center gap-2.5 min-w-0">
+              <span class="relative flex h-2.5 w-2.5 shrink-0">
+                <span class="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-400 shadow-[0_0_10px_#34d399]"></span>
+              </span>
+              <div class="truncate">
+                <span id="hudApp" class="text-sm font-semibold text-white tracking-[-0.015em]">Antigravity</span>
+                <span class="text-white/40 mx-1">·</span>
+                <span id="hudTitle" class="text-sm font-medium text-white/95 tracking-[-0.01em]">Architecture decision required</span>
+              </div>
+            </div>
+            <span id="hudBadge" class="shrink-0 text-xs font-semibold px-2 py-0.5 rounded-full bg-sky-400/15 text-sky-300 border border-sky-300/25">
+              4 Detailed Choices
+            </span>
+          </div>
+
+          <!-- Truncated Summary Row (Hoverable for full description) -->
+          <div
+            id="hudSummaryRow"
+            onmouseenter="showSummaryPopover(this)"
+            onmouseleave="hidePopover()"
+            class="flex items-center justify-between gap-2 pl-5 mb-2.5 py-0.5 rounded-lg hover:bg-white/5 px-2 transition-colors cursor-help"
+          >
+            <p id="hudSummaryShort" class="text-xs text-white/75 truncate">
+              Schema diff affects `users` and `sessions` across 3 shards with active foreign keys…
+            </p>
+            <span class="shrink-0 text-xs font-medium text-sky-300/90 bg-sky-400/10 border border-sky-400/20 rounded px-1.5 py-0.5">
+              Hover full ⋯
+            </span>
+          </div>
+
+          <!-- Mode A: 2x2 Option Pills (Shows concise subtitle on button, full text on hover) -->
+          <div id="optionsContainer" class="grid grid-cols-2 gap-2">
+            <button
+              onmouseenter="showOptionPopover(0, this)"
+              onmouseleave="hidePopover(); this.classList.remove('pressed')"
+              onpointerdown="this.classList.add('pressed')"
+              onpointerup="this.classList.remove('pressed')"
+              onclick="selectOption(event, 0)"
+              oncontextmenu="focusWithOption(event, 0)"
+              class="glass-pill rounded-xl px-3 py-2 text-left flex items-center justify-between gap-1.5 group"
+            >
+              <span class="text-xs font-semibold text-white/95 truncate">1 &nbsp;Zero-Downtime Dual-Write</span>
+              <div class="flex items-center gap-1 shrink-0">
+                <span class="text-xs text-sky-300 font-bold">⋯</span>
+                <kbd class="text-xs font-mono px-1.5 py-0.5 rounded bg-white/10 text-white/70">Alt+1</kbd>
+              </div>
+            </button>
+
+            <button
+              onmouseenter="showOptionPopover(1, this)"
+              onmouseleave="hidePopover(); this.classList.remove('pressed')"
+              onpointerdown="this.classList.add('pressed')"
+              onpointerup="this.classList.remove('pressed')"
+              onclick="selectOption(event, 1)"
+              oncontextmenu="focusWithOption(event, 1)"
+              class="glass-pill rounded-xl px-3 py-2 text-left flex items-center justify-between gap-1.5 group"
+            >
+              <span class="text-xs font-semibold text-white/95 truncate">2 &nbsp;Blue-Green Replica Swap</span>
+              <div class="flex items-center gap-1 shrink-0">
+                <span class="text-xs text-sky-300 font-bold">⋯</span>
+                <kbd class="text-xs font-mono px-1.5 py-0.5 rounded bg-white/10 text-white/70">Alt+2</kbd>
+              </div>
+            </button>
+
+            <button
+              onmouseenter="showOptionPopover(2, this)"
+              onmouseleave="hidePopover(); this.classList.remove('pressed')"
+              onpointerdown="this.classList.add('pressed')"
+              onpointerup="this.classList.remove('pressed')"
+              onclick="selectOption(event, 2)"
+              oncontextmenu="focusWithOption(event, 2)"
+              class="glass-pill rounded-xl px-3 py-2 text-left flex items-center justify-between gap-1.5 group"
+            >
+              <span class="text-xs font-semibold text-white/95 truncate">3 &nbsp;Maintenance Lock Migration</span>
+              <div class="flex items-center gap-1 shrink-0">
+                <span class="text-xs text-sky-300 font-bold">⋯</span>
+                <kbd class="text-xs font-mono px-1.5 py-0.5 rounded bg-white/10 text-white/70">Alt+3</kbd>
+              </div>
+            </button>
+
+            <button
+              onmouseenter="showOptionPopover(3, this)"
+              onmouseleave="hidePopover(); this.classList.remove('pressed')"
+              onpointerdown="this.classList.add('pressed')"
+              onpointerup="this.classList.remove('pressed')"
+              onclick="selectOption(event, 3)"
+              oncontextmenu="focusWithOption(event, 3)"
+              class="glass-pill rounded-xl px-3 py-2 text-left flex items-center justify-between gap-1.5 group"
+            >
+              <span class="text-xs font-semibold text-white/95 truncate">4 &nbsp;Dry-Run Explain Plan Only</span>
+              <div class="flex items-center gap-1 shrink-0">
+                <span class="text-xs text-sky-300 font-bold">⋯</span>
+                <kbd class="text-xs font-mono px-1.5 py-0.5 rounded bg-white/10 text-white/70">Alt+4</kbd>
+              </div>
+            </button>
+          </div>
+
+          <!-- Mode B: Summary + Inline Spotlight Quick-Reply Bar -->
+          <div id="replyContainer" class="hidden">
+            <div class="relative flex items-center">
+              <input
+                id="quickReplyInput"
+                type="text"
+                placeholder="Reply inline without switching windows (Enter to send)..."
+                onkeydown="handleReplyKey(event)"
+                class="w-full rounded-xl bg-white/10 border border-white/15 focus:border-sky-400/60 focus:bg-white/15 px-3 py-2 text-xs text-white placeholder-white/45 outline-none transition-colors"
+              />
+              <button
+                onclick="submitInlineReply()"
+                class="control-btn absolute right-1.5 px-2.5 py-1 rounded-lg bg-sky-500/30 hover:bg-sky-500/45 border border-sky-300/30 text-xs font-medium text-sky-100"
+              >
+                Send ↵
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Simulated Windows 11 Taskbar strip -->
+      <div class="absolute bottom-0 inset-x-0 h-6 bg-black/55 backdrop-blur-md border-t border-white/10 flex items-center justify-center gap-3 px-4">
+        <div class="w-3.5 h-3.5 rounded-sm bg-sky-400/80"></div>
+        <div class="w-3.5 h-3.5 rounded-sm bg-white/30"></div>
+        <div class="w-3.5 h-3.5 rounded-sm bg-emerald-400/70"></div>
+        <span class="text-xs text-white/45 ml-2">Windows 11 Taskbar · Hover any pill to expand full LLM text</span>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const hud = document.getElementById('glassHud');
+    const pop = document.getElementById('hoverPopover');
+    const popHeading = document.getElementById('popoverHeading');
+    const popBody = document.getElementById('popoverBody');
+    const contentWrap = document.getElementById('hudContentWrap');
+    const codeLog = document.getElementById('codeLog');
+    const statusToast = document.getElementById('statusToast');
+    const telemetry = document.getElementById('springTelemetry');
+
+    const scenarios = {
+      options: {
+        app: 'Antigravity',
+        title: 'Architecture decision required',
+        badge: '4 Detailed Choices',
+        summaryShort: 'Schema diff affects `users` and `sessions` across 3 shards with active foreign keys…',
+        summaryFull: 'Schema diff affects `users` and `sessions` across 3 production shards (1.4M rows) with active foreign key constraints and zero-downtime SLA requirements. Hover any option pill below to read the full tradeoff before clicking.',
+        options: [
+          {
+            subtitle: 'Zero-Downtime Dual-Write',
+            full: 'Zero-Downtime Dual-Write: Creates shadow columns with dual-write triggers, backfills 1.4M rows in 10k batches, and swaps views atomically with zero lock contention (~4 mins).'
+          },
+          {
+            subtitle: 'Blue-Green Replica Swap',
+            full: 'Blue-Green Replica Swap: Applies DDL on read-replica, verifies checksums against primary WAL stream, and promotes replica via connection pooler cutover (<50ms pause).'
+          },
+          {
+            subtitle: 'Maintenance Lock Migration',
+            full: 'Maintenance Lock Migration: Acquires ACCESS EXCLUSIVE table lock inside a single transaction and runs ALTER TABLE directly. Fastest execution (~9s) but blocks writes briefly.'
+          },
+          {
+            subtitle: 'Dry-Run Explain Plan Only',
+            full: 'Dry-Run Explain Plan Only: Generates the full SQL migration script and runs EXPLAIN ANALYZE inside a rolled-back transaction on staging without modifying schema.'
+          }
+        ]
+      },
+      summary: {
+        app: 'Claude Code',
+        title: 'Completed Security & Performance Audit',
+        badge: 'Cycle Complete · 2.1s',
+        summaryShort: 'Audited 18 endpoints, patched 2 Named Pipe DACL issues, and verified zero regressions…',
+        summaryFull: 'Audited all 18 IPC and API endpoints: hardened Named Pipe DACL to current logon SID (D:P(A;;GA;;;SID)), added target HWND process allowlist verification, excluded transient clipboard writes from Cloud Clipboard history, and verified all 42 tests pass.',
+        options: []
+      }
+    };
+
+    let currentMode = 'options';
+
+    class Spring1D {
+      constructor(val = 0) {
+        this.value = val;
+        this.target = val;
+        this.velocity = 0;
+      }
+      reset(val, target = val, vel = 0) {
+        this.value = val;
+        this.target = target;
+        this.velocity = vel;
+      }
+      step(dt, omega = 21.5, zeta = 1.0) {
+        const disp = this.value - this.target;
+        if (Math.abs(disp) < 0.0015 && Math.abs(this.velocity) < 0.015) {
+          this.value = this.target;
+          this.velocity = 0;
+          return false;
+        }
+        const damping = 2.0 * zeta * omega;
+        const accel = -omega * omega * disp - damping * this.velocity;
+        this.velocity += accel * dt;
+        this.value += this.velocity * dt;
+        return true;
+      }
+    }
+
+    const ySpring = new Spring1D(0);
+    const scaleSpring = new Spring1D(1);
+    const opacitySpring = new Spring1D(1);
+    const popSpring = new Spring1D(0);
+    const popOriginX = new Spring1D(250);
+
+    let yZeta = 1.0;
+    let timeScale = 1.0;
+    let lastTime = 0;
+    let animFrame = null;
+    let popoverOpen = false;
+
+    function showOptionPopover(idx, btnEl) {
+      const opt = scenarios[currentMode].options[idx];
+      if (!opt) return;
+      const hudRect = hud.getBoundingClientRect();
+      const btnRect = btnEl.getBoundingClientRect();
+      const anchorX = (btnRect.left + btnRect.width / 2) - hudRect.left;
+
+      if (!popoverOpen) {
+        popOriginX.reset(anchorX, anchorX);
+      } else {
+        // Instant neighbour handoff: smoothly slide origin X without closing!
+        popOriginX.target = anchorX;
+      }
+      popoverOpen = true;
+      popHeading.textContent = `Option ${idx + 1} · ${opt.subtitle}`;
+      popBody.textContent = opt.full;
+      popSpring.target = 1;
+      ensureLoop();
+    }
+
+    function showSummaryPopover(rowEl) {
+      const s = scenarios[currentMode];
+      const hudRect = hud.getBoundingClientRect();
+      const center = hudRect.width / 2;
+      if (!popoverOpen) {
+        popOriginX.reset(center, center);
+      } else {
+        popOriginX.target = center;
+      }
+      popoverOpen = true;
+      popHeading.textContent = `${s.app} · Full Cycle Description`;
+      popBody.textContent = s.summaryFull;
+      popSpring.target = 1;
+      ensureLoop();
+    }
+
+    function hidePopover() {
+      popoverOpen = false;
+      popSpring.target = 0;
+      ensureLoop();
+    }
+
+    function renderHudFrame() {
+      const y = ySpring.value;
+      const s = scaleSpring.value;
+      const a = Math.max(0, Math.min(1, opacitySpring.value));
+
+      hud.style.transform = `translateY(${y.toFixed(2)}px) scale(${s.toFixed(4)})`;
+      hud.style.opacity = a.toFixed(3);
+
+      const pt = Math.max(0, Math.min(1, popSpring.value));
+      const pScale = 0.95 + 0.05 * pt;
+      const pY = (1 - pt) * 10 + y;
+      pop.style.transformOrigin = `${popOriginX.value.toFixed(1)}px 100%`;
+      pop.style.transform = `translateY(${pY.toFixed(2)}px) scale(${pScale.toFixed(4)})`;
+      pop.style.opacity = (pt * a).toFixed(3);
+
+      telemetry.textContent = `y: ${y.toFixed(1)}px · scale: ${s.toFixed(3)} · pop: ${pt.toFixed(2)}`;
+    }
+
+    function stepFrame(now) {
+      if (!lastTime) lastTime = now;
+      let dt = Math.min(0.033, Math.max(0.001, (now - lastTime) / 1000)) * timeScale;
+      lastTime = now;
+
+      let moving = false;
+      if (!isDragging) {
+        if (ySpring.step(dt, 21.5, yZeta)) moving = true;
+        if (scaleSpring.step(dt, 24.0, 1.0)) moving = true;
+      } else {
+        moving = true;
+      }
+      if (opacitySpring.step(dt, 24.0, 1.0)) moving = true;
+      if (popSpring.step(dt, 30.0, 1.0)) moving = true;
+      if (popOriginX.step(dt, 32.0, 1.0)) moving = true;
+
+      renderHudFrame();
+
+      if (moving) {
+        animFrame = requestAnimationFrame(stepFrame);
+      } else {
+        lastTime = 0;
+        animFrame = null;
+      }
+    }
+
+    function ensureLoop() {
+      if (!animFrame) {
+        lastTime = performance.now();
+        animFrame = requestAnimationFrame(stepFrame);
+      }
+    }
+
+    function toggleSlowMo() {
+      timeScale = timeScale === 1.0 ? 0.25 : 1.0;
+      const btn = document.getElementById('btnSlowMo');
+      btn.textContent = timeScale === 1.0 ? '0.25× Slow-Mo: Off' : '0.25× Slow-Mo: ON';
+      btn.className = timeScale === 1.0
+        ? 'control-btn px-2.5 py-1 rounded-lg text-xs font-medium bg-amber-500/20 text-amber-200 border border-amber-400/30 hover:bg-amber-500/30'
+        : 'control-btn px-2.5 py-1 rounded-lg text-xs font-semibold bg-amber-400/40 text-white border border-amber-300/60';
+    }
+
+    function retriggerSpring() {
+      hidePopover();
+      yZeta = 1.0;
+      ySpring.reset(68, 0, 0);
+      scaleSpring.reset(0.95, 1, 0);
+      opacitySpring.reset(0, 1, 0);
+      ensureLoop();
+    }
+
+    function dismissAndRespawn(message, releaseVel = 0) {
+      hidePopover();
+      codeLog.textContent = `> ${message}`;
+      statusToast.textContent = `✓ ${message}`;
+      statusToast.style.opacity = '1';
+
+      yZeta = 1.0;
+      ySpring.target = 86;
+      if (Math.abs(releaseVel) > 10) ySpring.velocity = releaseVel;
+      scaleSpring.target = 0.95;
+      opacitySpring.target = 0;
+      ensureLoop();
+
+      const delay = timeScale === 1.0 ? 850 : 2600;
+      setTimeout(() => retriggerSpring(), delay);
+      setTimeout(() => { statusToast.style.opacity = '0'; }, delay + 1400);
+    }
+
+    function selectOption(e, idx) {
+      e.stopPropagation();
+      const opt = scenarios[currentMode].options[idx];
+      dismissAndRespawn(`Dispatched full choice ("${opt.subtitle}") in background — focus kept!`);
+    }
+
+    function focusWithOption(e, idx) {
+      e.preventDefault();
+      e.stopPropagation();
+      const opt = scenarios[currentMode].options[idx];
+      dismissAndRespawn(`Right-click: Copied full text of "${opt.subtitle}" & focused LLM window.`);
+    }
+
+    function switchScenario(mode) {
+      currentMode = mode;
+      hidePopover();
+      const btnOpt = document.getElementById('btnModeOptions');
+      const btnSum = document.getElementById('btnModeSummary');
+      const optBox = document.getElementById('optionsContainer');
+      const repBox = document.getElementById('replyContainer');
+      const s = scenarios[mode];
+
+      contentWrap.classList.add('swapping');
+      scaleSpring.velocity -= 0.35;
+      ySpring.velocity += 95;
+      yZeta = 0.9;
+      ensureLoop();
+
+      setTimeout(() => {
+        document.getElementById('hudApp').textContent = s.app;
+        document.getElementById('hudTitle').textContent = s.title;
+        document.getElementById('hudBadge').textContent = s.badge;
+        document.getElementById('hudSummaryShort').textContent = s.summaryShort;
+
+        if (mode === 'options') {
+          btnOpt.className = 'control-btn px-2.5 py-1 rounded-lg text-xs font-medium bg-white/20 text-white border border-white/20';
+          btnSum.className = 'control-btn px-2.5 py-1 rounded-lg text-xs font-medium bg-white/5 text-white/75 hover:bg-white/10 border border-white/10';
+          optBox.classList.remove('hidden');
+          repBox.classList.add('hidden');
+        } else {
+          btnSum.className = 'control-btn px-2.5 py-1 rounded-lg text-xs font-medium bg-white/20 text-white border border-white/20';
+          btnOpt.className = 'control-btn px-2.5 py-1 rounded-lg text-xs font-medium bg-white/5 text-white/75 hover:bg-white/10 border border-white/10';
+          optBox.classList.add('hidden');
+          repBox.classList.remove('hidden');
+        }
+        contentWrap.classList.remove('swapping');
+      }, 95);
+    }
+
+    function handleReplyKey(e) {
+      if (e.key === 'Enter') submitInlineReply();
+    }
+
+    function submitInlineReply() {
+      const input = document.getElementById('quickReplyInput');
+      const val = input.value.trim() || 'Looks good, proceed';
+      input.value = '';
+      dismissAndRespawn(`Sent inline reply ("${val}") to LLM without switching windows!`);
+    }
+
+    // Drag & momentum
+    let isDragging = false;
+    let dragStartY = 0;
+    let dragStartOffset = 0;
+    let pointerHistory = [];
+
+    function rubberBand(overshoot, dimension, constant = 0.55) {
+      return (overshoot * dimension * constant) / (dimension + constant * Math.abs(overshoot));
+    }
+
+    function projectMomentum(v, decel = 0.994) {
+      return (v / 1000) * decel / (1 - decel);
+    }
+
+    hud.addEventListener('pointerdown', (e) => {
+      if (e.target.closest('button') || e.target.closest('input')) return;
+      if (isDragging) return;
+      hidePopover();
+      isDragging = true;
+      hud.setPointerCapture(e.pointerId);
+      dragStartY = e.clientY;
+      dragStartOffset = ySpring.value;
+      ySpring.velocity = 0;
+      pointerHistory = [{ y: e.clientY, t: performance.now() }];
+      ensureLoop();
+    });
+
+    hud.addEventListener('pointermove', (e) => {
+      if (!isDragging) return;
+      pointerHistory.unshift({ y: e.clientY, t: performance.now() });
+      if (pointerHistory.length > 4) pointerHistory.pop();
+      const raw = dragStartOffset + (e.clientY - dragStartY);
+      ySpring.value = raw < 0 ? -rubberBand(-raw, 115) : raw;
+      renderHudFrame();
+    });
+
+    hud.addEventListener('pointerup', (e) => {
+      if (!isDragging) return;
+      isDragging = false;
+      hud.releasePointerCapture(e.pointerId);
+
+      let releaseVel = 0;
+      if (pointerHistory.length >= 2) {
+        const dtSec = (pointerHistory[0].t - pointerHistory[pointerHistory.length - 1].t) / 1000;
+        if (dtSec > 0.001 && dtSec <= 0.25) {
+          releaseVel = (pointerHistory[0].y - pointerHistory[pointerHistory.length - 1].y) / dtSec;
+        }
+      }
+      ySpring.velocity = releaseVel;
+      const projected = ySpring.value + projectMomentum(releaseVel, 0.994);
+      if ((projected > 40 || releaseVel > 180) && releaseVel >= -20) {
+        dismissAndRespawn('Dismissed HUD via downward momentum flick', releaseVel);
+      } else {
+        yZeta = 0.82;
+        ySpring.target = 0;
+        ensureLoop();
+      }
+    });
+
+    retriggerSpring();
+  </script>
+</body>
+</html>
