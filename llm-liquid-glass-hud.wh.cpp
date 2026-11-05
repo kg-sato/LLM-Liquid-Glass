@@ -1445,6 +1445,30 @@ static DWORD WINAPI HudHostThreadProc(LPVOID) {
         PostMessageW(g_hudHwnd, WM_APP_SHOW_LLM_HUD, 0, 0);
     }
 
+    // Automatically launch the background multi-agent transcript watcher (Antigravity, Claude Code, Codex)
+    {
+        wchar_t userProfile[MAX_PATH] = {};
+        if (GetEnvironmentVariableW(L"USERPROFILE", userProfile, MAX_PATH) > 0) {
+            std::wstring scriptPath = std::wstring(userProfile) +
+                L"\\.gemini\\antigravity\\scratch\\windhawk-llm-glass-hud\\tools\\agy_stop_hook.py";
+            if (GetFileAttributesW(scriptPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                std::wstring cmdLine = L"pythonw.exe \"" + scriptPath + L"\" --watch";
+                STARTUPINFOW si = {};
+                si.cb = sizeof(si);
+                si.dwFlags = STARTF_USESHOWWINDOW;
+                si.wShowWindow = SW_HIDE;
+                PROCESS_INFORMATION pi = {};
+                std::vector<wchar_t> mutableCmd(cmdLine.begin(), cmdLine.end());
+                mutableCmd.push_back(L'\0');
+                if (CreateProcessW(nullptr, mutableCmd.data(), nullptr, nullptr, FALSE,
+                                   CREATE_NO_WINDOW | DETACHED_PROCESS, nullptr, nullptr, &si, &pi)) {
+                    CloseHandle(pi.hThread);
+                    CloseHandle(pi.hProcess);
+                }
+            }
+        }
+    }
+
     std::thread pipeListener([]() {
         PSECURITY_DESCRIPTOR pSD = nullptr;
         bool hasSD = CreateOwnerOnlySecurityDescriptor(&pSD);
