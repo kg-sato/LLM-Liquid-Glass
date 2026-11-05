@@ -2,7 +2,7 @@
 // @id              llm-liquid-glass-hud
 // @name            LLM Liquid Glass HUD (Apple Spotlight & Dynamic Notification)
 // @description     Apple Liquid Glass floating HUD near the taskbar that pops up when an LLM finishes a cycle, displays interactive multiple-choice options or summary text, and lets you reply/select without leaving your active window.
-// @version         1.5.0
+// @version         1.5.1
 // @author          kg-sato
 // @github          https://github.com/kg-sato/LLM-Liquid-Glass
 // @include         explorer.exe
@@ -123,6 +123,7 @@ struct LLMCyclePayload {
     bool summaryIsLarge = false;
     std::vector<OptionEntry> options;
     HWND targetWindow = nullptr;
+    std::wstring targetSessionId;
 };
 
 static bool g_isExplorerHost = false;
@@ -132,6 +133,7 @@ static HANDLE g_pipeThread = nullptr;
 static ULONG_PTR g_gdiplusToken = 0;
 static std::mutex g_payloadMutex;
 static LLMCyclePayload g_currentPayload;
+static LONGLONG g_lastRichPayloadQpc = 0;
 
 // ============================================================================
 // Security, Privacy & Smart Subtitle Extraction Helpers
@@ -457,6 +459,85 @@ static OptionEntry MakeOptionEntry(const std::wstring& rawOpt) {
     return entry;
 }
 
+static bool IsValidClaudeLocalSessionId(const std::wstring& s) {
+    if (s.size() < 10 || s.size() > 70) return false;
+    if (s.compare(0, 6, L"local_") != 0) return false;
+    for (size_t i = 6; i < s.size(); ++i) {
+        wchar_t ch = s[i];
+        bool ok = (ch >= L'0' && ch <= L'9') ||
+                  (ch >= L'a' && ch <= L'z') ||
+                  (ch >= L'A' && ch <= L'Z') ||
+                  ch == L'-' || ch == L'_';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+static std::wstring GetClaudeDesktopActiveSessionId() {
+    wchar_t localAppData[MAX_PATH] = {};
+    if (GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH) == 0) {
+        return L"";
+    }
+    std::wstring logPath = std::wstring(localAppData) + L"\\Claude\\logs\\main.log";
+    HANDLE hFile = CreateFileW(
+        logPath.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr
+    );
+    if (hFile == INVALID_HANDLE_VALUE) {
+        return L"";
+    }
+
+    LARGE_INTEGER fileSize = {};
+    if (!GetFileSizeEx(hFile, &fileSize) || fileSize.QuadPart <= 0) {
+        CloseHandle(hFile);
+        return L"";
+    }
+
+    const LONGLONG kMaxTailBytes = 65536;
+    LARGE_INTEGER seekPos = {};
+    if (fileSize.QuadPart > kMaxTailBytes) {
+        seekPos.QuadPart = fileSize.QuadPart - kMaxTailBytes;
+    }
+    SetFilePointerEx(hFile, seekPos, nullptr, FILE_BEGIN);
+
+    DWORD toRead = static_cast<DWORD>(std::min<LONGLONG>(fileSize.QuadPart - seekPos.QuadPart, kMaxTailBytes));
+    std::string buf(toRead, '\0');
+    DWORD bytesRead = 0;
+    BOOL ok = ReadFile(hFile, buf.data(), toRead, &bytesRead, nullptr);
+    CloseHandle(hFile);
+    if (!ok || bytesRead == 0) {
+        return L"";
+    }
+    buf.resize(bytesRead);
+
+    const char* marker = "LocalSessions.setFocusedSession: sessionId=local_";
+    size_t pos = buf.rfind(marker);
+    if (pos == std::string::npos) {
+        return L"";
+    }
+
+    size_t idStart = pos + strlen("LocalSessions.setFocusedSession: sessionId=");
+    size_t idEnd = idStart;
+    while (idEnd < buf.size()) {
+        char c = buf[idEnd];
+        bool validChar = (c >= '0' && c <= '9') ||
+                         (c >= 'a' && c <= 'z') ||
+                         (c >= 'A' && c <= 'Z') ||
+                         c == '-' || c == '_';
+        if (!validChar) break;
+        idEnd++;
+    }
+
+    std::string narrowId = buf.substr(idStart, idEnd - idStart);
+    std::wstring wideId(narrowId.begin(), narrowId.end());
+    return IsValidClaudeLocalSessionId(wideId) ? wideId : L"";
+}
+
 static LLMCyclePayload ParsePipeMessage(const std::wstring& raw) {
     LLMCyclePayload p;
     std::vector<std::wstring> parts;
@@ -478,7 +559,17 @@ static LLMCyclePayload ParsePipeMessage(const std::wstring& raw) {
         SplitSubtitleAndFullText(parts[3], 68, 900, p.summaryShort, p.summaryFull, p.summaryIsLarge);
     }
     if (parts.size() >= 5 && !parts[4].empty()) {
-        ULONG_PTR hwndVal = wcstoull(parts[4].c_str(), nullptr, 16);
+        std::wstring targetField = parts[4];
+        std::wstring hwndPart = targetField;
+        size_t atPos = targetField.find(L'@');
+        if (atPos != std::wstring::npos) {
+            hwndPart = targetField.substr(0, atPos);
+            std::wstring candidateSession = targetField.substr(atPos + 1);
+            if (IsValidClaudeLocalSessionId(candidateSession)) {
+                p.targetSessionId = candidateSession;
+            }
+        }
+        ULONG_PTR hwndVal = wcstoull(hwndPart.c_str(), nullptr, 16);
         HWND candidate = reinterpret_cast<HWND>(hwndVal);
         if (IsAuthorizedTargetWindow(candidate)) {
             p.targetWindow = candidate;
@@ -601,6 +692,10 @@ static void DispatchToGlassHUD(const LLMCyclePayload& payload) {
     wchar_t hwndBuf[32] = {};
     swprintf_s(hwndBuf, L"%llX", reinterpret_cast<unsigned long long>(payload.targetWindow));
     serialized += hwndBuf;
+    if (IsValidClaudeLocalSessionId(payload.targetSessionId)) {
+        serialized += L"@";
+        serialized += payload.targetSessionId;
+    }
     serialized += L"|";
     for (size_t i = 0; i < payload.options.size(); ++i) {
         if (i > 0) serialized += L";";
@@ -650,9 +745,11 @@ static void SendAnswerToLLM(const std::wstring& rawAnswerText, bool focusWindowO
     if (answerText.empty()) return;
 
     HWND target = nullptr;
+    std::wstring targetSessionId;
     {
         std::lock_guard<std::mutex> lock(g_payloadMutex);
         target = g_currentPayload.targetWindow;
+        targetSessionId = g_currentPayload.targetSessionId;
     }
 
     std::wstring savedClipboard;
@@ -676,9 +773,18 @@ static void SendAnswerToLLM(const std::wstring& rawAnswerText, bool focusWindowO
         return;
     }
 
+    bool hasClaudeSession = IsValidClaudeLocalSessionId(targetSessionId);
+
     if (focusWindowOnly) {
         if (IsIconic(target)) ShowWindow(target, SW_RESTORE);
         SetForegroundWindow(target);
+        if (hasClaudeSession) {
+            std::wstring activeSession = GetClaudeDesktopActiveSessionId();
+            if (activeSession != targetSessionId) {
+                std::wstring deepLink = L"claude://code/continue?session=" + targetSessionId + L"&source=desktop_action";
+                ShellExecuteW(nullptr, L"open", deepLink.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            }
+        }
         return;
     }
 
@@ -690,8 +796,32 @@ static void SendAnswerToLLM(const std::wstring& rawAnswerText, bool focusWindowO
     BOOL attachedFg = (fgThread && fgThread != curThread) ? AttachThreadInput(curThread, fgThread, TRUE) : FALSE;
     BOOL attachedTarget = (targetThread && targetThread != curThread) ? AttachThreadInput(curThread, targetThread, TRUE) : FALSE;
 
+    if (IsIconic(target)) ShowWindow(target, SW_RESTORE);
     SetForegroundWindow(target);
-    Sleep(18);
+
+    if (hasClaudeSession) {
+        std::wstring activeSession = GetClaudeDesktopActiveSessionId();
+        if (activeSession != targetSessionId) {
+            std::wstring deepLink = L"claude://code/continue?session=" + targetSessionId + L"&source=desktop_action";
+            ShellExecuteW(nullptr, L"open", deepLink.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+
+            // Wait for Claude Desktop to route to the target session tab (up to 1.5s)
+            for (int attempt = 0; attempt < 60; ++attempt) {
+                Sleep(25);
+                if (GetClaudeDesktopActiveSessionId() == targetSessionId) {
+                    break;
+                }
+            }
+            // Allow React + requestAnimationFrame (dK) to focus ChatComposerEditor in the newly mounted chat
+            Sleep(110);
+            SetForegroundWindow(target);
+            Sleep(20);
+        } else {
+            Sleep(22);
+        }
+    } else {
+        Sleep(18);
+    }
 
     if (GetForegroundWindow() == target) {
         INPUT inputs[6] = {};
@@ -702,7 +832,7 @@ static void SendAnswerToLLM(const std::wstring& rawAnswerText, bool focusWindowO
         inputs[4].type = INPUT_KEYBOARD; inputs[4].ki.wVk = VK_RETURN;
         inputs[5].type = INPUT_KEYBOARD; inputs[5].ki.wVk = VK_RETURN; inputs[5].ki.dwFlags = KEYEVENTF_KEYUP;
         SendInput(6, inputs, sizeof(INPUT));
-        Sleep(18);
+        Sleep(55);
     }
 
     if (previousForeground && IsWindow(previousForeground) && previousForeground != g_hudHwnd) {
@@ -1602,13 +1732,32 @@ static DWORD WINAPI HudHostThreadProc(LPVOID) {
                     size_t charCount = std::min<size_t>(bytesRead / sizeof(wchar_t), 4095);
                     buffer[charCount] = L'\0';
                     LLMCyclePayload parsed = ParsePipeMessage(std::wstring(buffer, charCount));
-                    {
-                        std::lock_guard<std::mutex> lock(g_payloadMutex);
-                        g_currentPayload = parsed;
+                    bool isGenericFlash =
+                        (parsed.summaryFull == L"The agent finished its cycle and is waiting for your input.") &&
+                        parsed.targetSessionId.empty() &&
+                        parsed.options.empty();
+                    LONGLONG nowQpc = 0;
+                    QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&nowQpc));
+                    bool skipGenericOverwrite = false;
+                    if (isGenericFlash && g_anim.qpcFreq > 0 && g_lastRichPayloadQpc > 0) {
+                        double elapsedSec = static_cast<double>(nowQpc - g_lastRichPayloadQpc) /
+                                            static_cast<double>(g_anim.qpcFreq);
+                        if (elapsedSec < 6.0 || (g_anim.visible && !g_anim.dismissing)) {
+                            skipGenericOverwrite = true;
+                        }
                     }
-                    HWND hwnd = g_hudHwnd;
-                    if (hwnd && !g_shuttingDown.load()) {
-                        PostMessageW(hwnd, WM_APP_SHOW_LLM_HUD, 0, 0);
+                    if (!skipGenericOverwrite) {
+                        if (!isGenericFlash) {
+                            g_lastRichPayloadQpc = nowQpc;
+                        }
+                        {
+                            std::lock_guard<std::mutex> lock(g_payloadMutex);
+                            g_currentPayload = parsed;
+                        }
+                        HWND hwnd = g_hudHwnd;
+                        if (hwnd && !g_shuttingDown.load()) {
+                            PostMessageW(hwnd, WM_APP_SHOW_LLM_HUD, 0, 0);
+                        }
                     }
                 }
             }

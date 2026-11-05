@@ -17,9 +17,11 @@ Security Hardening (cybersecurity-skills/appsec & identity-access):
 
 import argparse
 import ctypes
+import re
 import sys
 
 PIPE_NAME = r"\\.\pipe\WindhawkLLMGlassHUD"
+SESSION_ID_RE = re.compile(r"^local_[A-Za-z0-9_-]{1,64}$")
 
 
 def sanitize_field(value: str, max_len: int) -> str:
@@ -55,6 +57,7 @@ def send_to_hud(
     summary: str,
     options: list[str] | None = None,
     hwnd: int | None = None,
+    session_id: str | None = None,
 ) -> bool:
     target_hwnd = hwnd if hwnd is not None else get_foreground_or_console_hwnd()
     safe_app = sanitize_field(app, 40) or "Antigravity"
@@ -64,8 +67,14 @@ def send_to_hud(
     safe_opts = [sanitize_field(opt, 650) for opt in (options or [])[:4]]
     safe_opts = [opt for opt in safe_opts if opt]
 
+    clean_session = (session_id or "").strip()
+    if clean_session and SESSION_ID_RE.match(clean_session):
+        target_field = f"{target_hwnd:X}@{clean_session}"
+    else:
+        target_field = f"{target_hwnd:X}"
+
     opts_str = ";".join(safe_opts)
-    payload = f"{safe_app}|{safe_badge}|{safe_title}|{safe_summary}|{target_hwnd:X}|{opts_str}"
+    payload = f"{safe_app}|{safe_badge}|{safe_title}|{safe_summary}|{target_field}|{opts_str}"
     encoded = payload.encode("utf-16-le")
 
     GENERIC_WRITE = 0x40000000
@@ -118,6 +127,11 @@ def main() -> int:
         help="Optional multiple-choice pills (1-4). Use 'Subtitle :: Full text' or 'Subtitle: Full text' for large choices.",
     )
     parser.add_argument("--hwnd", type=lambda x: int(x, 0), default=None, help="Target window HWND (hex or int)")
+    parser.add_argument(
+        "--session-id",
+        default=None,
+        help="Optional Claude Desktop hostSessionId (local_<uuid>) to route replies to the exact chat tab",
+    )
 
     args = parser.parse_args()
     success = send_to_hud(
@@ -127,6 +141,7 @@ def main() -> int:
         summary=args.summary,
         options=args.options,
         hwnd=args.hwnd,
+        session_id=args.session_id,
     )
     return 0 if success else 1
 

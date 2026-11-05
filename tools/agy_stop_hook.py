@@ -53,20 +53,26 @@ def strip_markdown_links(text: str) -> str:
     return re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
 
 
-def find_window_by_process_or_title(exe_names: list[str], title_keywords: list[str]) -> int:
-    """Finds a visible top-level window matching either the process executable name or window title."""
+def find_window_by_process_or_title(
+    exe_names: list[str],
+    title_keywords: list[str],
+    preferred_title_substrings: list[str] | None = None,
+) -> int:
+    """Finds a visible top-level window matching the process executable name (preferring specific title matches) or window title."""
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
+    found_by_exe_and_pref = 0
     found_by_exe = 0
     found_by_title = 0
 
     exe_lower = {e.lower() for e in exe_names}
-    kw_lower = [k.lower() for k in title_keywords]
+    kw_lower = [k.lower() for k in title_keywords if k]
+    pref_lower = [p.lower() for p in (preferred_title_substrings or []) if p and len(p) >= 2]
 
     WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
 
     def enum_cb(hwnd, _lparam):
-        nonlocal found_by_exe, found_by_title
+        nonlocal found_by_exe_and_pref, found_by_exe, found_by_title
         if not user32.IsWindowVisible(hwnd):
             return True
         length = user32.GetWindowTextLengthW(hwnd)
@@ -85,20 +91,26 @@ def find_window_by_process_or_title(exe_names: list[str], title_keywords: list[s
                 sz = ctypes.wintypes.DWORD(260)
                 if kernel32.QueryFullProcessImageNameW(hproc, 0, ebuf, ctypes.byref(sz)):
                     base_exe = os.path.basename(ebuf.value).lower()
-                    if base_exe in exe_lower and not found_by_exe:
-                        found_by_exe = hwnd
+                    if base_exe in exe_lower:
+                        if not found_by_exe:
+                            found_by_exe = hwnd
+                        if pref_lower and any(p in title for p in pref_lower):
+                            found_by_exe_and_pref = hwnd
                 kernel32.CloseHandle(hproc)
 
         if not found_by_title:
-            for kw in kw_lower:
-                if kw in title:
-                    found_by_title = hwnd
-                    break
+            if pref_lower and any(p in title for p in pref_lower):
+                found_by_title = hwnd
+            else:
+                for kw in kw_lower:
+                    if kw in title:
+                        found_by_title = hwnd
+                        break
 
-        return False if found_by_exe else True
+        return False if found_by_exe_and_pref else True
 
     user32.EnumWindows(WNDENUMPROC(enum_cb), 0)
-    return found_by_exe or found_by_title
+    return found_by_exe_and_pref or found_by_exe or found_by_title
 
 
 def extract_choices_and_summary(markdown_text: str) -> tuple[str, str, list[str]]:
@@ -351,6 +363,100 @@ def parse_codex_line(line: str) -> tuple[bool, str, list[str]]:
         return (False, "", [])
 
 
+def resolve_claude_session_metadata(transcript_path: str, home: str | None = None) -> tuple[str, str, str]:
+    """
+    Maps a Claude transcript `<cliSessionId>.jsonl` to `(host_session_id, chat_title, cwd)`.
+    - `host_session_id` is `local_<uuid>` when running inside Claude Desktop (`Claude.exe`).
+    - `chat_title` is the user-visible session name (e.g. '3D projection avatar system').
+    """
+    if not transcript_path:
+        return ("", "", "")
+    if home is None:
+        home = os.path.expanduser("~")
+    cli_sid = os.path.splitext(os.path.basename(transcript_path))[0].strip()
+    if not cli_sid:
+        return ("", "", "")
+
+    # 1. Check active session descriptors in ~/.claude/sessions/*.json
+    for sfile in glob.glob(os.path.join(home, ".claude", "sessions", "*.json")):
+        try:
+            with open(sfile, "r", encoding="utf-8", errors="ignore") as f:
+                data = json.load(f)
+            if data.get("sessionId") == cli_sid:
+                host_sid = (data.get("hostSessionId") or "").strip()
+                name = (data.get("name") or "").strip()
+                cwd = (data.get("cwd") or "").strip()
+                if host_sid or name:
+                    return (host_sid, name, cwd)
+        except Exception:
+            pass
+
+    # 2. Fallback: Check Claude Desktop local session metadata in LocalAppData / AppData
+    search_patterns = [
+        os.path.join(
+            home,
+            "AppData",
+            "Local",
+            "Claude-Data",
+            "*",
+            "claude-code-sessions",
+            "*",
+            "*",
+            "local_*.json",
+        ),
+        os.path.join(
+            home,
+            "AppData",
+            "Roaming",
+            "Claude",
+            "claude-code-sessions",
+            "*",
+            "*",
+            "local_*.json",
+        ),
+    ]
+    for pat in search_patterns:
+        for lfile in glob.glob(pat):
+            try:
+                with open(lfile, "r", encoding="utf-8", errors="ignore") as f:
+                    data = json.load(f)
+                if data.get("cliSessionId") == cli_sid:
+                    host_sid = (data.get("sessionId") or "").strip()
+                    title = (data.get("title") or "").strip()
+                    cwd = (data.get("cwd") or "").strip()
+                    return (host_sid, title, cwd)
+            except Exception:
+                pass
+
+    return ("", "", "")
+
+
+def resolve_codex_session_metadata(rollout_path: str, home: str | None = None) -> tuple[str, str]:
+    """Maps a Codex rollout `.jsonl` path to `(thread_title, cwd)` via `~/.codex/state_5.sqlite`."""
+    if not rollout_path:
+        return ("", "")
+    if home is None:
+        home = os.path.expanduser("~")
+    db_path = os.path.join(home, ".codex", "state_5.sqlite")
+    if not os.path.isfile(db_path):
+        return ("", "")
+    try:
+        base_name = os.path.basename(rollout_path)
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.5)
+        row = con.execute(
+            "SELECT title, cwd FROM threads WHERE rollout_path LIKE ? LIMIT 1",
+            (f"%{base_name}",),
+        ).fetchone()
+        con.close()
+        if row:
+            title = (str(row[0] or "").splitlines()[0] if row[0] else "").strip()
+            cwd = str(row[1] or "").strip()
+            return (title, cwd)
+    except Exception:
+        pass
+    return ("", "")
+
+
 def get_codex_active_rollout_paths(home: str) -> list[str]:
     """Queries ~/.codex/state_5.sqlite for recently updated non-subagent rollout paths."""
     paths: list[str] = []
@@ -406,7 +512,7 @@ def resolve_transcript_candidates(payload: dict) -> list[tuple[str, str]]:
     return candidates
 
 
-def read_last_response_from_candidates(payload: dict) -> tuple[str, str, list[str]]:
+def read_last_response_from_candidates(payload: dict) -> tuple[str, str, list[str], str]:
     for app_label, path in resolve_transcript_candidates(payload):
         if not path or not os.path.isfile(path):
             continue
@@ -432,10 +538,10 @@ def read_last_response_from_candidates(payload: dict) -> tuple[str, str, list[st
                             except Exception:
                                 pass
             if last_text:
-                return (app_label, last_text, last_opts)
+                return (app_label, last_text, last_opts, path)
         except Exception:
             pass
-    return ("Antigravity", "", [])
+    return ("Antigravity", "", [], "")
 
 
 def ensure_watcher_running() -> None:
@@ -555,7 +661,41 @@ def run_watcher_daemon() -> int:
                         if triggered and text:
                             title, summary, parsed_opts = extract_choices_and_summary(text)
                             final_opts = explicit_opts if explicit_opts else parsed_opts
-                            sig = f"{app_name}|{title}|{summary}|{';'.join(final_opts)}"
+
+                            host_session_id = ""
+                            chat_name = ""
+                            cwd = ""
+                            effective_exes = exe_names
+                            pref_titles: list[str] = []
+
+                            if app_name == "Claude Code":
+                                host_session_id, chat_name, cwd = resolve_claude_session_metadata(
+                                    path, home
+                                )
+                                if host_session_id:
+                                    effective_exes = ["Claude.exe"]
+                                if chat_name:
+                                    pref_titles.append(chat_name)
+                                if cwd:
+                                    pref_titles.append(os.path.basename(cwd.rstrip("\\/")))
+                            elif app_name == "Codex":
+                                chat_name, cwd = resolve_codex_session_metadata(path, home)
+                                if chat_name:
+                                    pref_titles.append(chat_name)
+                                if cwd:
+                                    pref_titles.append(os.path.basename(cwd.rstrip("\\/")))
+
+                            display_app = (
+                                f"Claude · {chat_name[:25]}"
+                                if (app_name == "Claude Code" and chat_name)
+                                else (
+                                    f"Codex · {chat_name[:25]}"
+                                    if (app_name == "Codex" and chat_name)
+                                    else app_name
+                                )
+                            )
+
+                            sig = f"{display_app}|{host_session_id}|{title}|{summary}|{';'.join(final_opts)}"
                             if sig != last_dispatched_sig:
                                 last_dispatched_sig = sig
                                 badge = (
@@ -564,15 +704,16 @@ def run_watcher_daemon() -> int:
                                     else "Cycle Complete"
                                 )
                                 target_hwnd = find_window_by_process_or_title(
-                                    exe_names, win_keywords
+                                    effective_exes, win_keywords, pref_titles
                                 )
                                 send_to_hud(
-                                    app=app_name,
+                                    app=display_app,
                                     badge=badge,
                                     title=title,
                                     summary=summary,
                                     options=final_opts,
                                     hwnd=target_hwnd if target_hwnd else None,
+                                    session_id=host_session_id or None,
                                 )
                 except Exception:
                     pass
@@ -601,8 +742,12 @@ def main() -> int:
         or ""
     ).strip()
 
+    host_session_id = ""
+    display_app = "Antigravity"
+
     if codex_direct_msg:
         app_label = "Codex"
+        display_app = "Codex"
         last_response = codex_direct_msg
         explicit_opts: list[str] = []
         target_hwnd = find_window_by_process_or_title(
@@ -610,10 +755,30 @@ def main() -> int:
             ["Codex", "OpenAI Codex", "Terminal"],
         )
     else:
-        app_label, last_response, explicit_opts = read_last_response_from_candidates(payload)
+        app_label, last_response, explicit_opts, matched_path = read_last_response_from_candidates(
+            payload
+        )
+        display_app = app_label
+        pref_titles: list[str] = []
+        if app_label == "Claude Code":
+            host_session_id, chat_name, cwd = resolve_claude_session_metadata(
+                matched_path or payload.get("transcript_path", "")
+            )
+            if chat_name:
+                display_app = f"Claude · {chat_name[:25]}"
+                pref_titles.append(chat_name)
+            if cwd:
+                pref_titles.append(os.path.basename(cwd.rstrip("\\/")))
         target_hwnd = find_window_by_process_or_title(
-            ["Antigravity.exe"] if app_label == "Antigravity" else ["Claude.exe", "Cursor.exe", "Code.exe"],
+            ["Antigravity.exe"]
+            if app_label == "Antigravity"
+            else (
+                ["Claude.exe"]
+                if host_session_id
+                else ["Claude.exe", "Cursor.exe", "Code.exe", "WindowsTerminal.exe"]
+            ),
             [app_label],
+            pref_titles,
         )
 
     if last_response:
@@ -627,12 +792,13 @@ def main() -> int:
 
     badge = f"{len(options)} Choices · {app_label}" if options else "Cycle Complete"
     send_to_hud(
-        app=app_label,
+        app=display_app,
         badge=badge,
         title=title,
         summary=summary,
         options=options,
         hwnd=target_hwnd if target_hwnd else None,
+        session_id=host_session_id or None,
     )
 
     # Output valid Stop hook JSON contract so Antigravity / Claude Code stops normally
