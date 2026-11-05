@@ -38,10 +38,10 @@ An Apple-inspired **Liquid Glass floating HUD** positioned near the bottom taskb
 // ==WindhawkModSettings==
 /*
 - openWindowMode: false
-  $name: Click Action: Open LLM Window (instead of Read & Reply on Notification)
-  $description: Off (default) = Read full summary/options on the HUD and reply inline without leaving your active window. On = Clicking the notification or an option opens and switches to the LLM window & chat.
+  $name: Open LLM Window on Click (instead of Read & Reply on Notification)
+  $description: Off (default) = Read full summary/options on the HUD and reply inline without leaving your active window. On = Clicking the notification or an option opens and switches to the LLM window and chat.
 - keepOnPreviousSide: true
-  $name: Multi-Monitor: Keep Window & HUD on Previous Monitor / Side
+  $name: Keep Window & HUD on Previous Monitor / Side (Multi-Monitor)
   $description: Keeps the LLM window on the monitor and side-snap position it was already on, and remembers any monitor/side you drag the HUD notification to.
 - glassOpacity: 176
   $name: Glass Surface Opacity (0-255)
