@@ -54,7 +54,7 @@ An Apple-inspired **Liquid Glass floating HUD** positioned near the bottom taskb
 - interceptToasts: true
   $name: Intercept LLM App Notifications & Taskbar Flashes
   $description: Automatically trigger the Glass HUD when Antigravity, Cursor, VS Code, Claude, or Terminal fires a notification or flashes on cycle completion.
-- showDemoOnStartup: true
+- showDemoOnStartup: false
   $name: Show Welcome Preview on Mod Start / Reload
   $description: Automatically pop up the Apple Liquid Glass HUD once when the mod loads in explorer.exe so you can test the animations and hover popovers immediately.
 */
@@ -108,7 +108,7 @@ struct ModSettings {
     int autoDismissSeconds = 18;
     bool enableHotkeys = true;
     bool interceptToasts = true;
-    bool showDemoOnStartup = true;
+    bool showDemoOnStartup = false;
 } g_settings;
 
 struct OptionEntry {

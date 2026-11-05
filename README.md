@@ -67,21 +67,17 @@ Why doesn't Windows automatically know when an LLM finishes a turn? Because Elec
 
 We included [`tools/agy_stop_hook.py`](./tools/agy_stop_hook.py), which automatically reads the last assistant message from the transcript, extracts any numbered/lettered options (or falls back to Summary Mode), and triggers the Liquid Glass HUD.
 
-Add this to your `hooks.json` (e.g. `~/.gemini/antigravity/hooks/hooks.json` or `.gemini/hooks/hooks.json`):
+Add this to your global `hooks.json` (`~/.gemini/config/hooks.json`) or workspace `.agents/hooks.json`:
 
 ```json
 {
-  "hooks": {
+  "llm-liquid-glass-hud": {
+    "enabled": true,
     "Stop": [
       {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python \"C:/Users/kgsat/.gemini/antigravity/scratch/windhawk-llm-glass-hud/tools/agy_stop_hook.py\"",
-            "timeout": 5
-          }
-        ]
+        "type": "command",
+        "command": "python \"C:/Users/kgsat/.gemini/antigravity/scratch/windhawk-llm-glass-hud/tools/agy_stop_hook.py\"",
+        "timeout": 5
       }
     ]
   }

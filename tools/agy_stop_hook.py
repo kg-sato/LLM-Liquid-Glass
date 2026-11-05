@@ -35,7 +35,7 @@ def extract_choices_and_summary(markdown_text: str) -> tuple[str, str, list[str]
         m = opt_pattern.match(clean)
         if m and len(options) < 4:
             options.append(m.group(1).strip())
-        elif not line.startswith("```") and not line.startswith("|") and not line.startswith("<"):
+        elif not line.startswith("```") and not line.startswith("|") and not line.startswith("<") and clean != "---":
             summary_lines.append(clean)
 
     title = summary_lines[0][:90] if summary_lines else "Agent finished turn"
@@ -43,24 +43,50 @@ def extract_choices_and_summary(markdown_text: str) -> tuple[str, str, list[str]
     return (title, summary, options)
 
 
-def read_last_model_response(transcript_path: str) -> str:
-    if not transcript_path or not os.path.isfile(transcript_path):
-        return ""
-    try:
-        last_content = ""
-        with open(transcript_path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                if '"PLANNER_RESPONSE"' in line or '"assistant"' in line:
-                    try:
-                        obj = json.loads(line)
-                        content = obj.get("content") or ""
-                        if isinstance(content, str) and content.strip():
-                            last_content = content.strip()
-                    except Exception:
-                        pass
-        return last_content
-    except Exception:
-        return ""
+def resolve_transcript_candidates(payload: dict) -> list[str]:
+    candidates: list[str] = []
+    tp = payload.get("transcriptPath", "")
+    if tp:
+        candidates.append(tp)
+        # Also check .system_generated/logs/transcript.jsonl relative to brain/<convId>
+        conv_id = payload.get("conversationId", "")
+        if conv_id:
+            brain_log = os.path.expanduser(
+                os.path.join("~", ".gemini", "antigravity", "brain", conv_id, ".system_generated", "logs", "transcript.jsonl")
+            )
+            candidates.append(brain_log)
+    else:
+        conv_id = payload.get("conversationId", "")
+        if conv_id:
+            candidates.append(
+                os.path.expanduser(
+                    os.path.join("~", ".gemini", "antigravity", "brain", conv_id, ".system_generated", "logs", "transcript.jsonl")
+                )
+            )
+    return candidates
+
+
+def read_last_model_response(payload: dict) -> str:
+    for path in resolve_transcript_candidates(payload):
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            last_content = ""
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if '"PLANNER_RESPONSE"' in line or '"assistant"' in line:
+                        try:
+                            obj = json.loads(line)
+                            content = obj.get("content") or ""
+                            if isinstance(content, str) and content.strip():
+                                last_content = content.strip()
+                        except Exception:
+                            pass
+            if last_content:
+                return last_content
+        except Exception:
+            pass
+    return ""
 
 
 def main() -> int:
@@ -70,8 +96,7 @@ def main() -> int:
     except Exception:
         payload = {}
 
-    transcript_path = payload.get("transcriptPath", "")
-    last_response = read_last_model_response(transcript_path)
+    last_response = read_last_model_response(payload)
 
     if last_response:
         title, summary, options = extract_choices_and_summary(last_response)
