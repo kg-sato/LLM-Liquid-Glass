@@ -2,7 +2,7 @@
 // @id              llm-liquid-glass-hud
 // @name            LLM Liquid Glass HUD (Apple Spotlight & Dynamic Notification)
 // @description     Apple Liquid Glass floating HUD near the taskbar that pops up when an LLM finishes a cycle, displays interactive multiple-choice options or summary text, and lets you reply/select without leaving your active window.
-// @version         1.4.0
+// @version         1.4.1
 // @author          kg-sato
 // @github          https://github.com/kg-sato/LLM-Liquid-Glass
 // @include         explorer.exe
@@ -27,10 +27,8 @@ An Apple-inspired **Liquid Glass floating HUD** positioned near the bottom taskb
   - When an LLM provides a long option or multi-sentence description, the button automatically displays the concise **subtitle/heading** (e.g., before `:` or `—`, or a smartly truncated label) with a subtle `⋯` indicator.
   - Hovering any truncated option pill or long summary description springs open an **origin-aware Apple Liquid Glass Popover** above the HUD showing the full multi-line text.
   - Supports Emil Kowalski's **instant neighbour tooltip rule**: once the hover popover is open, moving across adjacent options updates and repositions it immediately with zero re-entry delay.
-- **Automatic Detection + Built-in Demo Preview**:
-  - Automatically pops up a welcome preview in `explorer.exe` when first compiled/enabled (configurable via `showDemoOnStartup`) so you can immediately feel the springs and hover popovers.
-  - Hooks `SetWindowTextW` (window title status completion transitions), `FlashWindowEx`, and `Shell_NotifyIconW` in `Antigravity.exe`, `Cursor.exe`, `Code.exe`, `Claude.exe`, and `WindowsTerminal.exe`.
-  - Includes `tools/agy_stop_hook.py` to hook directly into Antigravity / Claude Code `Stop` lifecycle events so every completed LLM turn automatically extracts the response summary & options and pops up the HUD.
+- **Automatic Multi-Agent Detection**:
+  - Automatically launches `tools/agy_stop_hook.py --watch` and hooks `FlashWindowEx` and `Shell_NotifyIconW` across Antigravity, Claude Code / Claude Desktop, Codex, Cursor, VS Code, and Windows Terminal.
 */
 // ==/WindhawkModReadme==
 
@@ -54,9 +52,6 @@ An Apple-inspired **Liquid Glass floating HUD** positioned near the bottom taskb
 - interceptToasts: true
   $name: Intercept LLM App Notifications & Taskbar Flashes
   $description: Automatically trigger the Glass HUD when Antigravity, Cursor, VS Code, Claude, or Terminal fires a notification or flashes on cycle completion.
-- showDemoOnStartup: false
-  $name: Show Welcome Preview on Mod Start / Reload
-  $description: Automatically pop up the Apple Liquid Glass HUD once when the mod loads in explorer.exe so you can test the animations and hover popovers immediately.
 */
 // ==/WindhawkModSettings==
 
@@ -108,7 +103,6 @@ struct ModSettings {
     int autoDismissSeconds = 18;
     bool enableHotkeys = true;
     bool interceptToasts = true;
-    bool showDemoOnStartup = false;
 } g_settings;
 
 struct OptionEntry {
@@ -450,30 +444,6 @@ static OptionEntry MakeOptionEntry(const std::wstring& rawOpt) {
     OptionEntry entry;
     SplitSubtitleAndFullText(rawOpt, 26, 650, entry.shortSubtitle, entry.fullText, entry.isLarge);
     return entry;
-}
-
-static LLMCyclePayload MakeWelcomeDemoPayload() {
-    LLMCyclePayload p;
-    p.sourceApp = L"Antigravity";
-    p.modelBadge = L"HUD Active \x00B7 v1.4";
-    p.title = L"LLM Liquid Glass HUD is Ready";
-    SplitSubtitleAndFullText(
-        L"Hover any option with '\x22EF' or this description to inspect full multi-line LLM outputs in an origin-aware Apple Liquid Glass Popover. Drag down to flick-dismiss!",
-        68, 900, p.summaryShort, p.summaryFull, p.summaryIsLarge
-    );
-    p.options.push_back(MakeOptionEntry(
-        L"Zero-Downtime Dual-Write :: Creates shadow columns with dual-write triggers, backfills 1.4M rows in 10k batches, and swaps views atomically with zero lock contention."
-    ));
-    p.options.push_back(MakeOptionEntry(
-        L"Blue-Green Replica Swap :: Applies DDL on read-replica, verifies checksums against primary WAL stream, and promotes replica via connection pooler cutover."
-    ));
-    p.options.push_back(MakeOptionEntry(
-        L"Maintenance Lock Migration :: Acquires ACCESS EXCLUSIVE table lock inside a single transaction and runs ALTER TABLE directly (~9s)."
-    ));
-    p.options.push_back(MakeOptionEntry(
-        L"Dry-Run Explain Plan Only :: Generates the full SQL migration script and runs EXPLAIN ANALYZE inside a rolled-back transaction on staging."
-    ));
-    return p;
 }
 
 static LLMCyclePayload ParsePipeMessage(const std::wstring& raw) {
@@ -1411,6 +1381,21 @@ static LRESULT CALLBACK GlassHudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             }
             return 0;
         }
+
+        case WM_CLOSE: {
+            DestroyWindow(hwnd);
+            return 0;
+        }
+
+        case WM_DESTROY: {
+            KillTimer(hwnd, TIMER_SPRING_FRAME);
+            KillTimer(hwnd, TIMER_AUTO_DISMISS);
+            for (int k = 1; k <= 4; ++k) {
+                UnregisterHotKey(hwnd, 2000 + k);
+            }
+            PostQuitMessage(0);
+            return 0;
+        }
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
@@ -1436,14 +1421,6 @@ static DWORD WINAPI HudHostThreadProc(LPVOID) {
         0, 0, std::clamp(g_settings.hudWidthPx, 360, 960), 140 + kPopoverCanvasReservePx,
         nullptr, nullptr, wc.hInstance, nullptr
     );
-
-    if (g_settings.showDemoOnStartup && g_hudHwnd) {
-        {
-            std::lock_guard<std::mutex> lock(g_payloadMutex);
-            g_currentPayload = MakeWelcomeDemoPayload();
-        }
-        PostMessageW(g_hudHwnd, WM_APP_SHOW_LLM_HUD, 0, 0);
-    }
 
     // Automatically launch the background multi-agent transcript watcher (Antigravity, Claude Code, Codex)
     {
@@ -1487,7 +1464,8 @@ static DWORD WINAPI HudHostThreadProc(LPVOID) {
                 hasSD ? &sa : nullptr
             );
             if (hPipe == INVALID_HANDLE_VALUE) {
-                Sleep(500);
+                if (g_shuttingDown.load()) break;
+                Sleep(200);
                 continue;
             }
             BOOL connected = ConnectNamedPipe(hPipe, nullptr)
@@ -1497,7 +1475,7 @@ static DWORD WINAPI HudHostThreadProc(LPVOID) {
                 wchar_t buffer[4096] = {};
                 DWORD bytesRead = 0;
                 if (ReadFile(hPipe, buffer, sizeof(buffer) - sizeof(wchar_t), &bytesRead, nullptr) &&
-                    bytesRead >= sizeof(wchar_t)) {
+                    bytesRead >= sizeof(wchar_t) && !g_shuttingDown.load()) {
                     size_t charCount = std::min<size_t>(bytesRead / sizeof(wchar_t), 4095);
                     buffer[charCount] = L'\0';
                     LLMCyclePayload parsed = ParsePipeMessage(std::wstring(buffer, charCount));
@@ -1505,8 +1483,9 @@ static DWORD WINAPI HudHostThreadProc(LPVOID) {
                         std::lock_guard<std::mutex> lock(g_payloadMutex);
                         g_currentPayload = parsed;
                     }
-                    if (g_hudHwnd) {
-                        PostMessageW(g_hudHwnd, WM_APP_SHOW_LLM_HUD, 0, 0);
+                    HWND hwnd = g_hudHwnd;
+                    if (hwnd && !g_shuttingDown.load()) {
+                        PostMessageW(hwnd, WM_APP_SHOW_LLM_HUD, 0, 0);
                     }
                 }
             }
@@ -1516,18 +1495,38 @@ static DWORD WINAPI HudHostThreadProc(LPVOID) {
 
         if (pSD) LocalFree(pSD);
     });
-    pipeListener.detach();
 
     MSG msg;
-    while (!g_shuttingDown.load() && GetMessageW(&msg, nullptr, 0, 0)) {
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
+        if (g_shuttingDown.load()) break;
     }
 
+    g_shuttingDown.store(true);
     if (g_hudHwnd) {
         DestroyWindow(g_hudHwnd);
         g_hudHwnd = nullptr;
     }
+
+    // Wake pipeListener if it is still blocked in ConnectNamedPipe
+    if (pipeListener.joinable()) {
+        HANDLE hWake = CreateFileW(
+            kPipeName,
+            GENERIC_WRITE,
+            0,
+            nullptr,
+            OPEN_EXISTING,
+            SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+            nullptr
+        );
+        if (hWake != INVALID_HANDLE_VALUE) {
+            CloseHandle(hWake);
+        }
+        pipeListener.join();
+    }
+
+    UnregisterClassW(kHudClassName, wc.hInstance);
     GdiplusShutdown(g_gdiplusToken);
     return 0;
 }
@@ -1600,7 +1599,6 @@ static void LoadSettings() {
     g_settings.autoDismissSeconds = Wh_GetIntSetting(L"autoDismissSeconds");
     g_settings.enableHotkeys = Wh_GetIntSetting(L"enableHotkeys") != 0;
     g_settings.interceptToasts = Wh_GetIntSetting(L"interceptToasts") != 0;
-    g_settings.showDemoOnStartup = Wh_GetIntSetting(L"showDemoOnStartup") != 0;
 }
 
 BOOL Wh_ModInit() {
@@ -1611,6 +1609,7 @@ BOOL Wh_ModInit() {
     if (StrStrIW(PathFindFileNameW(exePath), L"explorer.exe")) {
         g_isExplorerHost = true;
         g_pipeThread = CreateThread(nullptr, 0, HudHostThreadProc, nullptr, 0, nullptr);
+        return TRUE;
     }
 
     HMODULE hShell32 = LoadLibraryW(L"shell32.dll");
@@ -1636,24 +1635,17 @@ BOOL Wh_ModInit() {
 
 void Wh_ModSettingsChanged() {
     LoadSettings();
-    if (g_isExplorerHost && g_hudHwnd) {
-        if (g_settings.showDemoOnStartup && !g_anim.visible) {
-            {
-                std::lock_guard<std::mutex> lock(g_payloadMutex);
-                g_currentPayload = MakeWelcomeDemoPayload();
-            }
-            PostMessageW(g_hudHwnd, WM_APP_SHOW_LLM_HUD, 0, 0);
-        } else if (g_anim.visible) {
-            ApplyAppleGlassBackdrop(g_hudHwnd);
-            RenderGlassHud(g_hudHwnd);
-        }
+    if (g_isExplorerHost && g_hudHwnd && g_anim.visible) {
+        ApplyAppleGlassBackdrop(g_hudHwnd);
+        RenderGlassHud(g_hudHwnd);
     }
 }
 
 void Wh_ModUninit() {
     g_shuttingDown.store(true);
-    if (g_hudHwnd) {
-        PostMessageW(g_hudHwnd, WM_CLOSE, 0, 0);
+    HWND hwnd = g_hudHwnd;
+    if (hwnd) {
+        PostMessageW(hwnd, WM_CLOSE, 0, 0);
     }
     HANDLE hWake = CreateFileW(
         kPipeName,
@@ -1668,7 +1660,8 @@ void Wh_ModUninit() {
         CloseHandle(hWake);
     }
     if (g_pipeThread) {
-        WaitForSingleObject(g_pipeThread, 1500);
+        WaitForSingleObject(g_pipeThread, 5000);
         CloseHandle(g_pipeThread);
+        g_pipeThread = nullptr;
     }
 }
