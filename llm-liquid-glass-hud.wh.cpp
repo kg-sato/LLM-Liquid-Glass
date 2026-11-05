@@ -2,7 +2,7 @@
 // @id              llm-liquid-glass-hud
 // @name            LLM Liquid Glass HUD (Apple Spotlight & Dynamic Notification)
 // @description     Apple Liquid Glass floating HUD near the taskbar that pops up when an LLM finishes a cycle, displays interactive multiple-choice options or summary text, and lets you reply/select without leaving your active window.
-// @version         1.5.1
+// @version         1.6.0
 // @author          kg-sato
 // @github          https://github.com/kg-sato/LLM-Liquid-Glass
 // @include         explorer.exe
@@ -37,12 +37,18 @@ An Apple-inspired **Liquid Glass floating HUD** positioned near the bottom taskb
 
 // ==WindhawkModSettings==
 /*
+- openWindowMode: false
+  $name: Click Action: Open LLM Window (instead of Read & Reply on Notification)
+  $description: Off (default) = Read full summary/options on the HUD and reply inline without leaving your active window. On = Clicking the notification or an option opens and switches to the LLM window & chat.
+- keepOnPreviousSide: true
+  $name: Multi-Monitor: Keep Window & HUD on Previous Monitor / Side
+  $description: Keeps the LLM window on the monitor and side-snap position it was already on, and remembers any monitor/side you drag the HUD notification to.
 - glassOpacity: 176
   $name: Glass Surface Opacity (0-255)
   $description: Opacity of the frosted Apple Liquid Glass tint (lower = more translucent).
 - bottomOffsetPx: 64
   $name: Bottom Offset from Screen Edge (px)
-  $description: Distance above the bottom of the primary monitor (above the taskbar).
+  $description: Distance above the bottom of the monitor (above the taskbar).
 - hudWidthPx: 540
   $name: HUD Width (px)
   $description: Width of the Spotlight-style floating glass bar.
@@ -100,6 +106,8 @@ enum ACCENT_STATE {
 };
 
 struct ModSettings {
+    bool openWindowMode = false;
+    bool keepOnPreviousSide = true;
     int glassOpacity = 176;
     int bottomOffsetPx = 64;
     int hudWidthPx = 540;
@@ -379,6 +387,11 @@ struct HudChoreography {
     bool isDragging = false;
     POINT dragStartScreenPt = {0, 0};
     float dragStartOffsetY = 0.0f;
+    float dragOffsetX = 0.0f;
+    float dragStartOffsetX = 0.0f;
+    bool hasCustomPosition = false;
+    int customScreenX = 0;
+    HMONITOR customMonitor = nullptr;
     PointerSample history[4] = {};
     int historyCount = 0;
 
@@ -473,12 +486,7 @@ static bool IsValidClaudeLocalSessionId(const std::wstring& s) {
     return true;
 }
 
-static std::wstring GetClaudeDesktopActiveSessionId() {
-    wchar_t localAppData[MAX_PATH] = {};
-    if (GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH) == 0) {
-        return L"";
-    }
-    std::wstring logPath = std::wstring(localAppData) + L"\\Claude\\logs\\main.log";
+static std::wstring ReadLastFocusedSessionFromLogFile(const std::wstring& logPath) {
     HANDLE hFile = CreateFileW(
         logPath.c_str(),
         GENERIC_READ,
@@ -536,6 +544,19 @@ static std::wstring GetClaudeDesktopActiveSessionId() {
     std::string narrowId = buf.substr(idStart, idEnd - idStart);
     std::wstring wideId(narrowId.begin(), narrowId.end());
     return IsValidClaudeLocalSessionId(wideId) ? wideId : L"";
+}
+
+static std::wstring GetClaudeDesktopActiveSessionId() {
+    wchar_t localAppData[MAX_PATH] = {};
+    if (GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH) == 0) {
+        return L"";
+    }
+    std::wstring baseDir = std::wstring(localAppData) + L"\\Claude\\logs\\";
+    std::wstring id = ReadLastFocusedSessionFromLogFile(baseDir + L"main.log");
+    if (!id.empty()) {
+        return id;
+    }
+    return ReadLastFocusedSessionFromLogFile(baseDir + L"main1.log");
 }
 
 static LLMCyclePayload ParsePipeMessage(const std::wstring& raw) {
@@ -742,7 +763,7 @@ static int ComputeTargetHudHeight(const LLMCyclePayload& p) {
 
 static void SendAnswerToLLM(const std::wstring& rawAnswerText, bool focusWindowOnly) {
     std::wstring answerText = SanitizeUntrustedString(rawAnswerText, 650);
-    if (answerText.empty()) return;
+    if (answerText.empty() && !focusWindowOnly) return;
 
     HWND target = nullptr;
     std::wstring targetSessionId;
@@ -767,26 +788,38 @@ static void SendAnswerToLLM(const std::wstring& rawAnswerText, bool focusWindowO
         CloseClipboard();
     }
 
-    SetEphemeralClipboardText(g_hudHwnd, answerText);
+    if (!answerText.empty()) {
+        SetEphemeralClipboardText(g_hudHwnd, answerText);
+    }
 
     if (!IsAuthorizedTargetWindow(target)) {
         return;
     }
 
     bool hasClaudeSession = IsValidClaudeLocalSessionId(targetSessionId);
+    bool wasMinimized = IsIconic(target) != FALSE;
+    RECT rcBefore = {};
+    BOOL hadRect = GetWindowRect(target, &rcBefore);
 
-    if (focusWindowOnly) {
-        if (IsIconic(target)) ShowWindow(target, SW_RESTORE);
-        SetForegroundWindow(target);
-        if (hasClaudeSession) {
-            std::wstring activeSession = GetClaudeDesktopActiveSessionId();
-            if (activeSession != targetSessionId) {
-                std::wstring deepLink = L"claude://code/continue?session=" + targetSessionId + L"&source=desktop_action";
-                ShellExecuteW(nullptr, L"open", deepLink.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    // Preserve exact monitor & side-snap position on multi-monitor setups
+    auto restoreSideIfMoved = [&]() {
+        if (!g_settings.keepOnPreviousSide || wasMinimized || !hadRect) return;
+        RECT rcAfter = {};
+        if (GetWindowRect(target, &rcAfter)) {
+            if (rcAfter.left != rcBefore.left || rcAfter.top != rcBefore.top ||
+                rcAfter.right != rcBefore.right || rcAfter.bottom != rcBefore.bottom) {
+                SetWindowPos(
+                    target,
+                    nullptr,
+                    rcBefore.left,
+                    rcBefore.top,
+                    rcBefore.right - rcBefore.left,
+                    rcBefore.bottom - rcBefore.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE
+                );
             }
         }
-        return;
-    }
+    };
 
     HWND previousForeground = GetForegroundWindow();
     DWORD curThread = GetCurrentThreadId();
@@ -796,8 +829,29 @@ static void SendAnswerToLLM(const std::wstring& rawAnswerText, bool focusWindowO
     BOOL attachedFg = (fgThread && fgThread != curThread) ? AttachThreadInput(curThread, fgThread, TRUE) : FALSE;
     BOOL attachedTarget = (targetThread && targetThread != curThread) ? AttachThreadInput(curThread, targetThread, TRUE) : FALSE;
 
-    if (IsIconic(target)) ShowWindow(target, SW_RESTORE);
+    if (wasMinimized) ShowWindow(target, SW_RESTORE);
     SetForegroundWindow(target);
+    restoreSideIfMoved();
+
+    if (focusWindowOnly) {
+        if (hasClaudeSession) {
+            std::wstring activeSession = GetClaudeDesktopActiveSessionId();
+            if (activeSession != targetSessionId) {
+                std::wstring deepLink = L"claude://code/continue?session=" + targetSessionId + L"&source=desktop_action";
+                ShellExecuteW(nullptr, L"open", deepLink.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                for (int attempt = 0; attempt < 40; ++attempt) {
+                    Sleep(20);
+                    restoreSideIfMoved();
+                    if (GetClaudeDesktopActiveSessionId() == targetSessionId) break;
+                }
+                SetForegroundWindow(target);
+                restoreSideIfMoved();
+            }
+        }
+        if (attachedTarget) AttachThreadInput(curThread, targetThread, FALSE);
+        if (attachedFg) AttachThreadInput(curThread, fgThread, FALSE);
+        return;
+    }
 
     if (hasClaudeSession) {
         std::wstring activeSession = GetClaudeDesktopActiveSessionId();
@@ -808,6 +862,7 @@ static void SendAnswerToLLM(const std::wstring& rawAnswerText, bool focusWindowO
             // Wait for Claude Desktop to route to the target session tab (up to 1.5s)
             for (int attempt = 0; attempt < 60; ++attempt) {
                 Sleep(25);
+                restoreSideIfMoved();
                 if (GetClaudeDesktopActiveSessionId() == targetSessionId) {
                     break;
                 }
@@ -815,6 +870,7 @@ static void SendAnswerToLLM(const std::wstring& rawAnswerText, bool focusWindowO
             // Allow React + requestAnimationFrame (dK) to focus ChatComposerEditor in the newly mounted chat
             Sleep(110);
             SetForegroundWindow(target);
+            restoreSideIfMoved();
             Sleep(20);
         } else {
             Sleep(22);
@@ -835,7 +891,10 @@ static void SendAnswerToLLM(const std::wstring& rawAnswerText, bool focusWindowO
         Sleep(55);
     }
 
-    if (previousForeground && IsWindow(previousForeground) && previousForeground != g_hudHwnd) {
+    restoreSideIfMoved();
+
+    if (!g_settings.openWindowMode && previousForeground &&
+        IsWindow(previousForeground) && previousForeground != g_hudHwnd) {
         SetForegroundWindow(previousForeground);
     }
 
@@ -875,8 +934,38 @@ static void RenderGlassHud(HWND hwnd) {
 
     int screenW = GetSystemMetrics(SM_CXSCREEN);
     int screenH = GetSystemMetrics(SM_CYSCREEN);
-    int baseX = (screenW - width) / 2;
-    int baseY = screenH - totalHeight - std::clamp(g_settings.bottomOffsetPx, 16, 400);
+    int bottomOffset = std::clamp(g_settings.bottomOffsetPx, 16, 400);
+    int dragX = static_cast<int>(std::round(g_anim.dragOffsetX));
+
+    int baseX = (screenW - width) / 2 + dragX;
+    int baseY = screenH - totalHeight - bottomOffset;
+
+    if (g_settings.keepOnPreviousSide) {
+        if (g_anim.hasCustomPosition) {
+            baseX = g_anim.customScreenX + dragX;
+            POINT probePt = { baseX + width / 2, screenH / 2 };
+            HMONITOR hMon = MonitorFromPoint(probePt, MONITOR_DEFAULTTONEAREST);
+            MONITORINFO mi = {};
+            mi.cbSize = sizeof(mi);
+            if (hMon && GetMonitorInfoW(hMon, &mi)) {
+                baseY = mi.rcMonitor.bottom - totalHeight - bottomOffset;
+            }
+        } else {
+            if (payload.targetWindow && IsWindow(payload.targetWindow)) {
+                g_anim.customMonitor = MonitorFromWindow(payload.targetWindow, MONITOR_DEFAULTTONEAREST);
+            }
+            if (g_anim.customMonitor) {
+                MONITORINFO mi = {};
+                mi.cbSize = sizeof(mi);
+                if (GetMonitorInfoW(g_anim.customMonitor, &mi)) {
+                    int monW = mi.rcMonitor.right - mi.rcMonitor.left;
+                    baseX = mi.rcMonitor.left + (monW - width) / 2 + dragX;
+                    baseY = mi.rcMonitor.bottom - totalHeight - bottomOffset;
+                }
+            }
+        }
+    }
+
     int actualY = baseY + static_cast<int>(std::round(g_anim.ySpring.value));
 
     HDC hdcScreen = GetDC(nullptr);
@@ -1110,6 +1199,23 @@ static void RenderGlassHud(HWND hwnd) {
                                  RectF(x + w - 23.0f, y, 19.0f, h), &vCenter, &expandHintBrush);
                 }
             }
+        } else if (g_settings.openWindowMode) {
+            RectF openBtnRect(18.0f, cardTopY + 83.0f, static_cast<float>(width - 36), 35.0f);
+            GraphicsPath openBtnPath;
+            AddRoundRect(openBtnPath, openBtnRect, 11.5f);
+
+            LinearGradientBrush openBtnFill(
+                PointF(18.0f, cardTopY + 83.0f),
+                PointF(18.0f, cardTopY + 118.0f),
+                Color(CA(96), 115, 182, 255),
+                Color(CA(68), 82, 148, 255)
+            );
+            Pen openBtnPen(Color(CA(175), 165, 218, 255), 1.15f);
+            g.FillPath(&openBtnFill, &openBtnPath);
+            g.DrawPath(&openBtnPen, &openBtnPath);
+
+            std::wstring openPrompt = L"Click to open " + payload.sourceApp + L" chat window   \x2192";
+            g.DrawString(openPrompt.c_str(), -1, &optFont, openBtnRect, &centerFmt, &titleBrush);
         } else {
             RectF inputRect(18.0f, cardTopY + 83.0f, static_cast<float>(width - 36), 35.0f);
             GraphicsPath inputPath;
@@ -1432,7 +1538,7 @@ static LRESULT CALLBACK GlassHudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 hasOptions = !g_currentPayload.options.empty();
             }
             int cardRelativeY = y - kPopoverCanvasReservePx;
-            if (!hasOptions && cardRelativeY >= 80 && cardRelativeY <= 122) {
+            if (!g_settings.openWindowMode && !hasOptions && cardRelativeY >= 80 && cardRelativeY <= 122) {
                 g_anim.replyBoxFocused = true;
                 SetForegroundWindow(hwnd);
                 SetFocus(hwnd);
@@ -1445,6 +1551,7 @@ static LRESULT CALLBACK GlassHudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             g_anim.popoverActive = false;
             g_anim.popoverProgress.target = 0.0f;
             GetCursorPos(&g_anim.dragStartScreenPt);
+            g_anim.dragStartOffsetX = g_anim.dragOffsetX;
             g_anim.dragStartOffsetY = g_anim.ySpring.value;
             g_anim.ySpring.velocity = 0.0f;
             g_anim.historyCount = 0;
@@ -1462,7 +1569,9 @@ static LRESULT CALLBACK GlassHudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 GetCursorPos(&pt);
                 g_anim.PushPointerSample(static_cast<float>(pt.y));
 
+                float deltaX = static_cast<float>(pt.x - g_anim.dragStartScreenPt.x);
                 float deltaY = static_cast<float>(pt.y - g_anim.dragStartScreenPt.y);
+                g_anim.dragOffsetX = g_anim.dragStartOffsetX + deltaX;
                 float rawOffset = g_anim.dragStartOffsetY + deltaY;
                 if (rawOffset < 0.0f) {
                     g_anim.ySpring.value = -RubberBand(-rawOffset, 120.0f);
@@ -1575,13 +1684,41 @@ static LRESULT CALLBACK GlassHudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             if (g_anim.isDragging) {
                 ReleaseCapture();
                 g_anim.isDragging = false;
+
+                POINT pt;
+                GetCursorPos(&pt);
+                float totalDeltaX = static_cast<float>(pt.x - g_anim.dragStartScreenPt.x);
+                float totalDeltaY = static_cast<float>(pt.y - g_anim.dragStartScreenPt.y);
+                int cardRelativeY = y - kPopoverCanvasReservePx;
+
+                // Click without dragging: in Open Window mode (or when clicking the top title bar), open the LLM chat window
+                if (std::fabs(totalDeltaX) < 7.0f && std::fabs(totalDeltaY) < 7.0f) {
+                    g_anim.dragOffsetX = 0.0f;
+                    g_anim.ySpring.target = 0.0f;
+                    if (g_settings.openWindowMode || (cardRelativeY >= 10 && cardRelativeY <= 40)) {
+                        SendAnswerToLLM(L"", true);
+                        StartDismissAnimation(hwnd);
+                        return 0;
+                    }
+                }
+
                 float releaseVel = g_anim.ComputeReleaseVelocityPxPerSec();
                 g_anim.ySpring.velocity = releaseVel;
 
                 float projectedY = g_anim.ySpring.value + ProjectMomentum(releaseVel, 0.994f);
-                if ((projectedY > 42.0f || releaseVel > 180.0f) && releaseVel >= -20.0f) {
+                if ((projectedY > 42.0f || releaseVel > 180.0f) && releaseVel >= -20.0f && std::fabs(totalDeltaX) < 60.0f) {
+                    g_anim.dragOffsetX = 0.0f;
                     StartDismissAnimation(hwnd, releaseVel);
                 } else {
+                    if (g_settings.keepOnPreviousSide && std::fabs(totalDeltaX) >= 12.0f) {
+                        RECT wndRc = {};
+                        if (GetWindowRect(hwnd, &wndRc)) {
+                            g_anim.hasCustomPosition = true;
+                            g_anim.customScreenX = wndRc.left;
+                            g_anim.customMonitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+                        }
+                    }
+                    g_anim.dragOffsetX = 0.0f;
                     g_anim.yZeta = IsReducedMotionEnabled() ? 1.0f : 0.82f;
                     g_anim.ySpring.target = 0.0f;
                     EnsureAnimationLoopRunning(hwnd);
@@ -1870,6 +2007,8 @@ static void LoadSettings() {
     g_settings.bottomOffsetPx = Wh_GetIntSetting(L"bottomOffsetPx");
     g_settings.hudWidthPx = Wh_GetIntSetting(L"hudWidthPx");
     g_settings.autoDismissSeconds = Wh_GetIntSetting(L"autoDismissSeconds");
+    g_settings.openWindowMode = Wh_GetIntSetting(L"openWindowMode") != 0;
+    g_settings.keepOnPreviousSide = Wh_GetIntSetting(L"keepOnPreviousSide") != 0;
     g_settings.enableHotkeys = Wh_GetIntSetting(L"enableHotkeys") != 0;
     g_settings.interceptToasts = Wh_GetIntSetting(L"interceptToasts") != 0;
 }
