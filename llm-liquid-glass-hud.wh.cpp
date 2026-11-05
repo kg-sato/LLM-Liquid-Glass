@@ -2,7 +2,7 @@
 // @id              llm-liquid-glass-hud
 // @name            LLM Liquid Glass HUD (Apple Spotlight & Dynamic Notification)
 // @description     Apple Liquid Glass floating HUD near the taskbar that pops up when an LLM finishes a cycle, displays interactive multiple-choice options or summary text, and lets you reply/select without leaving your active window.
-// @version         1.4.1
+// @version         1.5.0
 // @author          kg-sato
 // @github          https://github.com/kg-sato/LLM-Liquid-Glass
 // @include         explorer.exe
@@ -10,6 +10,8 @@
 // @include         Cursor.exe
 // @include         Code.exe
 // @include         Claude.exe
+// @include         Codex.exe
+// @include         codex.exe
 // @include         WindowsTerminal.exe
 // @architecture    x86-64
 // @compilerOptions -lgdi32 -luser32 -ldwmapi -lgdiplus -lole32 -lshell32 -lshlwapi -ladvapi32
@@ -22,9 +24,10 @@
 An Apple-inspired **Liquid Glass floating HUD** positioned near the bottom taskbar (Spotlight / visionOS style) that automatically surfaces when an LLM or coding agent finishes a cycle.
 
 ## Key Features
-- **Apple Liquid Glass Material**: Uses Windows 11 DWM Acrylic/Mica system backdrops combined with a high-DPI GDI+ specular rim highlight, soft elevation shadow, and optical typography.
+- **Luminous Apple Liquid Glass Material**: Uses a bright, frosted visionOS / macOS Tahoe translucent glass palette with top-edge light-catch specular highlights, inner frost sheen, and crisp glass keycap badges.
+- **Context-Aware Choice Extraction**: Distinguishes genuine user-selectable options (`AskUserQuestion`, `request_user_input`, or explicit decision prompts) from ordinary numbered status lists.
 - **Smart Compact Labels & Instant Hover Popover for Large LLM Outputs**:
-  - When an LLM provides a long option or multi-sentence description, the button automatically displays the concise **subtitle/heading** (e.g., before `:` or `—`, or a smartly truncated label) with a subtle `⋯` indicator.
+  - When an LLM provides a long option or multi-sentence description, the button automatically displays the concise **subtitle/heading** with a subtle `⋯` indicator.
   - Hovering any truncated option pill or long summary description springs open an **origin-aware Apple Liquid Glass Popover** above the HUD showing the full multi-line text.
   - Supports Emil Kowalski's **instant neighbour tooltip rule**: once the hover popover is open, moving across adjacent options updates and repositions it immediately with zero re-entry delay.
 - **Automatic Multi-Agent Detection**:
@@ -34,9 +37,9 @@ An Apple-inspired **Liquid Glass floating HUD** positioned near the bottom taskb
 
 // ==WindhawkModSettings==
 /*
-- glassOpacity: 215
+- glassOpacity: 176
   $name: Glass Surface Opacity (0-255)
-  $description: Opacity of the dark smoky Apple glass tint over the DWM Acrylic blur.
+  $description: Opacity of the frosted Apple Liquid Glass tint (lower = more translucent).
 - bottomOffsetPx: 64
   $name: Bottom Offset from Screen Edge (px)
   $description: Distance above the bottom of the primary monitor (above the taskbar).
@@ -51,7 +54,7 @@ An Apple-inspired **Liquid Glass floating HUD** positioned near the bottom taskb
   $description: Press Alt+1, Alt+2, Alt+3, or Alt+4 while the HUD is visible to answer without touching the mouse.
 - interceptToasts: true
   $name: Intercept LLM App Notifications & Taskbar Flashes
-  $description: Automatically trigger the Glass HUD when Antigravity, Cursor, VS Code, Claude, or Terminal fires a notification or flashes on cycle completion.
+  $description: Automatically trigger the Glass HUD when Antigravity, Cursor, VS Code, Claude, Codex, or Terminal fires a notification or flashes on cycle completion.
 */
 // ==/WindhawkModSettings==
 
@@ -97,7 +100,7 @@ enum ACCENT_STATE {
 };
 
 struct ModSettings {
-    int glassOpacity = 215;
+    int glassOpacity = 176;
     int bottomOffsetPx = 64;
     int hudWidthPx = 540;
     int autoDismissSeconds = 18;
@@ -253,6 +256,7 @@ static bool IsAuthorizedTargetWindow(HWND hwnd) {
         const wchar_t* baseName = PathFindFileNameW(exePath);
         static const wchar_t* kAllowedProcesses[] = {
             L"Antigravity.exe", L"Cursor.exe", L"Code.exe", L"Claude.exe",
+            L"Codex.exe", L"codex.exe", L"opencode-cli.exe",
             L"WindowsTerminal.exe", L"pwsh.exe", L"powershell.exe", L"cmd.exe",
             L"conhost.exe", L"OpenConsole.exe", L"wezterm-gui.exe", L"alacritty.exe"
         };
@@ -323,17 +327,22 @@ struct Spring1D {
         velocity = vel;
     }
 
-    bool Step(float dt, float omega = 22.0f, float zeta = 1.0f) {
+    bool Step(float dt, float omega = 26.0f, float zeta = 1.0f) {
         float disp = value - target;
-        if (std::fabs(disp) < 0.0015f && std::fabs(velocity) < 0.015f) {
+        if (std::fabs(disp) < 0.0008f && std::fabs(velocity) < 0.008f) {
             value = target;
             velocity = 0.0f;
             return false;
         }
+        int substeps = (dt > 0.007f) ? 2 : 1;
+        float subDt = dt / static_cast<float>(substeps);
         const float damping = 2.0f * zeta * omega;
-        const float accel = -omega * omega * disp - damping * velocity;
-        velocity += accel * dt;
-        value += velocity * dt;
+        for (int s = 0; s < substeps; ++s) {
+            float d = value - target;
+            float accel = -omega * omega * d - damping * velocity;
+            velocity += accel * subDt;
+            value += velocity * subDt;
+        }
         return true;
     }
 };
@@ -353,6 +362,7 @@ struct HudChoreography {
     Spring1D contentFadeSpring;
     Spring1D pillScale[4];
     Spring1D pillHover[4];
+    Spring1D pillEntrance[4];
 
     Spring1D popoverProgress;
     Spring1D popoverAnchorX;
@@ -384,6 +394,7 @@ struct HudChoreography {
         for (int i = 0; i < 4; ++i) {
             pillScale[i].Reset(1.0f, 1.0f);
             pillHover[i].Reset(0.0f, 0.0f);
+            pillEntrance[i].Reset(1.0f, 1.0f);
         }
         contentFadeSpring.Reset(1.0f, 1.0f);
         popoverProgress.Reset(0.0f, 0.0f);
@@ -515,26 +526,68 @@ static void ExtractOptionsFromText(
     }
 
     std::wstring summaryAccum;
+    std::wstring lastNonOptLine;
+    std::vector<OptionEntry> candidateOpts;
+    std::vector<int> candidateNums;
+
+    auto flushCandidateBlock = [&]() {
+        if (candidateOpts.size() >= 2 && candidateOpts.size() <= 4) {
+            bool sequential = true;
+            for (size_t i = 0; i < candidateNums.size(); ++i) {
+                if (candidateNums[i] != static_cast<int>(i + 1)) {
+                    sequential = false;
+                    break;
+                }
+            }
+            bool hasChoiceCue =
+                (lastNonOptLine.find(L'?') != std::wstring::npos) ||
+                (StrStrIW(lastNonOptLine.c_str(), L"pick") != nullptr) ||
+                (StrStrIW(lastNonOptLine.c_str(), L"choose") != nullptr) ||
+                (StrStrIW(lastNonOptLine.c_str(), L"select") != nullptr) ||
+                (StrStrIW(lastNonOptLine.c_str(), L"option") != nullptr) ||
+                (StrStrIW(lastNonOptLine.c_str(), L"which") != nullptr) ||
+                (StrStrIW(lastNonOptLine.c_str(), L"prefer") != nullptr) ||
+                (StrStrIW(lastNonOptLine.c_str(), L"ways") != nullptr);
+            bool isInfoHeader =
+                (StrStrIW(lastNonOptLine.c_str(), L"next") == lastNonOptLine.c_str()) ||
+                (StrStrIW(lastNonOptLine.c_str(), L"step") == lastNonOptLine.c_str()) ||
+                (StrStrIW(lastNonOptLine.c_str(), L"how ") == lastNonOptLine.c_str()) ||
+                (StrStrIW(lastNonOptLine.c_str(), L"what ") == lastNonOptLine.c_str());
+            if (sequential && hasChoiceCue && !isInfoHeader) {
+                outOptions = candidateOpts;
+            }
+        }
+        candidateOpts.clear();
+        candidateNums.clear();
+    };
+
     for (const auto& line : lines) {
         size_t firstNonSpace = line.find_first_not_of(L" \t");
         if (firstNonSpace == std::wstring::npos) continue;
         std::wstring trimmed = line.substr(firstNonSpace);
 
-        if (outOptions.size() < 4 && trimmed.size() > 3 &&
+        if (firstNonSpace <= 1 && candidateOpts.size() < 4 && trimmed.size() > 3 &&
             ((trimmed[0] >= L'1' && trimmed[0] <= L'4') || (trimmed[0] >= L'A' && trimmed[0] <= L'D')) &&
             (trimmed[1] == L')' || trimmed[1] == L'.' || trimmed[1] == L':')) {
             size_t optStart = trimmed.find_first_not_of(L" \t", 2);
             if (optStart != std::wstring::npos) {
+                int num = (trimmed[0] >= L'1' && trimmed[0] <= L'4')
+                    ? (trimmed[0] - L'0')
+                    : (trimmed[0] - L'A' + 1);
                 OptionEntry entry = MakeOptionEntry(trimmed.substr(optStart));
                 if (!entry.shortSubtitle.empty()) {
-                    outOptions.push_back(entry);
+                    candidateOpts.push_back(entry);
+                    candidateNums.push_back(num);
                 }
                 continue;
             }
         }
+        flushCandidateBlock();
+        lastNonOptLine = trimmed;
         if (!summaryAccum.empty()) summaryAccum += L" ";
         summaryAccum += trimmed;
     }
+    flushCandidateBlock();
 
     std::wstring rawSummary = summaryAccum.empty() ? text : summaryAccum;
     SplitSubtitleAndFullText(rawSummary, 68, 900, outSummaryShort, outSummaryFull, outSummaryIsLarge);
@@ -739,67 +792,104 @@ static void RenderGlassHud(HWND hwnd) {
         const FontFamily* fam = fontFamily.IsAvailable() ? &fontFamily : &fallbackFamily;
 
         Font badgeFont(fam, 11.0f, FontStyleBold, UnitPixel);
-        Font titleFont(fam, 15.0f, FontStyleBold, UnitPixel);
+        Font titleFont(fam, 14.5f, FontStyleBold, UnitPixel);
         Font bodyFont(fam, 13.0f, FontStyleRegular, UnitPixel);
         Font optFont(fam, 12.5f, FontStyleBold, UnitPixel);
+        Font keycapFont(fam, 11.0f, FontStyleBold, UnitPixel);
         Font popTitleFont(fam, 12.0f, FontStyleBold, UnitPixel);
         Font popBodyFont(fam, 12.5f, FontStyleRegular, UnitPixel);
 
-        RectF cardRect(2.0f, cardTopY + 2.0f, static_cast<float>(width - 4), static_cast<float>(cardHeight - 4));
-        GraphicsPath cardPath;
-        AddRoundRect(cardPath, cardRect, 20.0f);
+        // Soft outer ambient shadow ring for floating Apple elevation
+        RectF shadowRect(1.0f, cardTopY + 2.5f, static_cast<float>(width - 2), static_cast<float>(cardHeight - 3));
+        GraphicsPath shadowPath;
+        AddRoundRect(shadowPath, shadowRect, 23.0f);
+        Pen shadowPen(Color(A(45), 8, 12, 24), 2.0f);
+        g.DrawPath(&shadowPen, &shadowPath);
 
-        int baseGlassAlpha = std::clamp(g_settings.glassOpacity, 120, 248);
+        RectF cardRect(2.5f, cardTopY + 2.0f, static_cast<float>(width - 5), static_cast<float>(cardHeight - 4));
+        GraphicsPath cardPath;
+        AddRoundRect(cardPath, cardRect, 22.0f);
+
+        // Luminous Apple Liquid Glass surface (brighter, cleaner, frosted visionOS / macOS Tahoe palette)
+        int baseGlassAlpha = std::clamp(g_settings.glassOpacity, 110, 235);
         LinearGradientBrush glassBrush(
             PointF(0.0f, cardTopY),
             PointF(0.0f, cardTopY + static_cast<float>(cardHeight)),
-            Color(A(baseGlassAlpha - 12), 34, 36, 44),
-            Color(A(baseGlassAlpha + 7), 16, 17, 23)
+            Color(A(baseGlassAlpha - 14), 68, 76, 98),
+            Color(A(baseGlassAlpha + 4), 40, 46, 64)
         );
         g.FillPath(&glassBrush, &cardPath);
 
+        // Top-half frosted light-catch sheen (gives the luminous Apple glass feel)
+        RectF sheenRect(cardRect.X + 1.0f, cardRect.Y + 1.0f, cardRect.Width - 2.0f, cardRect.Height * 0.48f);
+        GraphicsPath sheenPath;
+        AddRoundRect(sheenPath, sheenRect, 21.0f);
+        LinearGradientBrush sheenBrush(
+            PointF(0.0f, cardRect.Y),
+            PointF(0.0f, cardRect.Y + cardRect.Height * 0.50f),
+            Color(A(44), 240, 246, 255),
+            Color(A(0), 240, 246, 255)
+        );
+        g.FillPath(&sheenBrush, &sheenPath);
+
+        // Crisp 2-layer specular rim (outer icy highlight + inner subtle glass bevel)
         LinearGradientBrush rimBrush(
             PointF(0.0f, cardTopY),
             PointF(0.0f, cardTopY + static_cast<float>(cardHeight)),
-            Color(A(150), 255, 255, 255),
-            Color(A(28), 255, 255, 255)
+            Color(A(215), 255, 255, 255),
+            Color(A(62), 200, 220, 255)
         );
-        Pen rimPen(&rimBrush, 1.25f);
+        Pen rimPen(&rimBrush, 1.35f);
         g.DrawPath(&rimPen, &cardPath);
 
         GraphicsPath pillPath;
-        AddRoundRect(pillPath, RectF(width / 2.0f - 18.0f, cardTopY + 7.5f, 36.0f, 4.0f), 2.0f);
-        SolidBrush handleBrush(Color(A(80), 255, 255, 255));
+        AddRoundRect(pillPath, RectF(width / 2.0f - 19.0f, cardTopY + 7.5f, 38.0f, 4.0f), 2.0f);
+        SolidBrush handleBrush(Color(A(115), 255, 255, 255));
         g.FillPath(&handleBrush, &pillPath);
 
-        SolidBrush orbGlowBrush(Color(CA(58), 52, 199, 89));
-        g.FillEllipse(&orbGlowBrush, 18.0f, cardTopY + 19.0f, 16.0f, 16.0f);
-        SolidBrush orbCoreBrush(Color(CA(255), 48, 209, 88));
-        g.FillEllipse(&orbCoreBrush, 22.0f, cardTopY + 23.0f, 8.0f, 8.0f);
+        SolidBrush orbGlowBrush(Color(CA(72), 64, 224, 120));
+        g.FillEllipse(&orbGlowBrush, 18.0f, cardTopY + 18.5f, 16.0f, 16.0f);
+        SolidBrush orbCoreBrush(Color(CA(255), 52, 215, 98));
+        g.FillEllipse(&orbCoreBrush, 22.0f, cardTopY + 22.5f, 8.0f, 8.0f);
 
-        SolidBrush titleBrush(Color(CA(250), 250, 251, 254));
-        SolidBrush mutedBrush(Color(CA(182), 205, 210, 224));
-        SolidBrush accentBrush(Color(CA(240), 122, 198, 255));
+        SolidBrush titleBrush(Color(CA(254), 252, 253, 255));
+        SolidBrush mutedBrush(Color(CA(218), 228, 234, 248));
+        SolidBrush accentBrush(Color(CA(250), 150, 212, 255));
 
         std::wstring headerLine = payload.sourceApp + L"  \x00B7  " + payload.title;
-        g.DrawString(headerLine.c_str(), -1, &titleFont, PointF(42.0f, cardTopY + 17.0f), &titleBrush);
+        StringFormat headerFmt;
+        headerFmt.SetTrimming(StringTrimmingEllipsisCharacter);
+        headerFmt.SetFormatFlags(StringFormatFlagsNoWrap);
+        g.DrawString(headerLine.c_str(), -1, &titleFont,
+                     RectF(42.0f, cardTopY + 16.5f, static_cast<float>(width - 210), 22.0f),
+                     &headerFmt, &titleBrush);
 
-        StringFormat rightFmt;
-        rightFmt.SetAlignment(StringAlignmentFar);
-        g.DrawString(payload.modelBadge.c_str(), -1, &badgeFont,
-                     RectF(width - 175.0f, cardTopY + 19.0f, 155.0f, 20.0f), &rightFmt, &accentBrush);
+        // Luminous pill badge on top-right
+        StringFormat centerFmt;
+        centerFmt.SetAlignment(StringAlignmentCenter);
+        centerFmt.SetLineAlignment(StringAlignmentCenter);
+        RectF badgeRect(static_cast<float>(width - 158), cardTopY + 15.5f, 138.0f, 21.0f);
+        GraphicsPath badgePath;
+        AddRoundRect(badgePath, badgeRect, 10.5f);
+        SolidBrush badgeFill(Color(CA(48), 140, 205, 255));
+        Pen badgePen(Color(CA(110), 175, 222, 255), 1.0f);
+        g.FillPath(&badgeFill, &badgePath);
+        g.DrawPath(&badgePen, &badgePath);
+        g.DrawString(payload.modelBadge.c_str(), -1, &badgeFont, badgeRect, &centerFmt, &accentBrush);
 
         std::wstring shownSummary = payload.summaryShort;
         if (payload.summaryIsLarge) {
-            shownSummary += L"  [Hover for full]";
+            shownSummary += L"   \x22EF";
         }
-        SolidBrush summaryHoverBrush(Color(CA(242), 165, 215, 255));
+        SolidBrush summaryHoverBrush(Color(CA(252), 185, 228, 255));
+        StringFormat summaryFmt;
+        summaryFmt.SetTrimming(StringTrimmingEllipsisWord);
         g.DrawString(
             shownSummary.c_str(),
             -1,
             &bodyFont,
-            RectF(20.0f, cardTopY + 44.0f, static_cast<float>(width - 40), payload.options.empty() ? 36.0f : 22.0f),
-            nullptr,
+            RectF(20.0f, cardTopY + 43.0f, static_cast<float>(width - 40), payload.options.empty() ? 36.0f : 23.0f),
+            &summaryFmt,
             g_anim.hoveredSummary ? &summaryHoverBrush : &mutedBrush
         );
 
@@ -808,8 +898,8 @@ static void RenderGlassHud(HWND hwnd) {
             float padX = 18.0f;
             float gap = 10.0f;
             float cellW = (width - padX * 2.0f - gap) / 2.0f;
-            float cellH = 34.0f;
-            float startY = cardTopY + 72.0f;
+            float cellH = 35.0f;
+            float startY = cardTopY + 71.0f;
 
             for (size_t i = 0; i < payload.options.size() && i < 4; ++i) {
                 int r = static_cast<int>(i) / cols;
@@ -819,59 +909,86 @@ static void RenderGlassHud(HWND hwnd) {
 
                 float pScale = g_anim.pillScale[i].value;
                 float hBlend = std::clamp(g_anim.pillHover[i].value, 0.0f, 1.0f);
+                float entranceT = std::clamp(g_anim.pillEntrance[i].value, 0.0f, 1.0f);
+                float yEntranceOffset = (1.0f - entranceT) * 9.0f;
+
+                auto PA_PILL = [contentAlpha, entranceT](int a) -> BYTE {
+                    return static_cast<BYTE>(std::clamp(static_cast<int>(a * contentAlpha * entranceT), 0, 255));
+                };
 
                 float w = cellW * pScale;
                 float h = cellH * pScale;
                 float x = baseCellX + (cellW - w) * 0.5f;
-                float y = baseCellY + (cellH - h) * 0.5f;
+                float y = baseCellY + (cellH - h) * 0.5f + yEntranceOffset;
 
                 RectF pillRect(x, y, w, h);
                 GraphicsPath optPath;
-                AddRoundRect(optPath, pillRect, 10.0f);
+                AddRoundRect(optPath, pillRect, 11.5f);
 
-                Color fillCol(
-                    CA(LerpByte(48, 118, hBlend)),
-                    LerpByte(255, 82, hBlend),
-                    LerpByte(255, 146, hBlend),
-                    255
+                LinearGradientBrush optFill(
+                    PointF(x, y),
+                    PointF(x, y + h),
+                    Color(
+                        PA_PILL(LerpByte(72, 155, hBlend)),
+                        LerpByte(245, 98, hBlend),
+                        LerpByte(248, 168, hBlend),
+                        255
+                    ),
+                    Color(
+                        PA_PILL(LerpByte(46, 122, hBlend)),
+                        LerpByte(225, 72, hBlend),
+                        LerpByte(234, 140, hBlend),
+                        255
+                    )
                 );
                 Color borderCol(
-                    CA(LerpByte(54, 205, hBlend)),
-                    LerpByte(255, 138, hBlend),
-                    LerpByte(255, 198, hBlend),
+                    PA_PILL(LerpByte(96, 230, hBlend)),
+                    LerpByte(255, 160, hBlend),
+                    LerpByte(255, 215, hBlend),
                     255
                 );
 
-                SolidBrush optFill(fillCol);
-                Pen optPen(borderCol, 1.0f);
+                Pen optPen(borderCol, 1.15f);
                 g.FillPath(&optFill, &optPath);
                 g.DrawPath(&optPen, &optPath);
 
-                std::wstring optLabel = std::to_wstring(i + 1) + L"   " + payload.options[i].shortSubtitle;
+                // Frosted Apple keycap badge for option number (1..4)
+                RectF keycapRect(x + 8.0f, y + (h - 20.0f) * 0.5f, 20.0f, 20.0f);
+                GraphicsPath keycapPath;
+                AddRoundRect(keycapPath, keycapRect, 6.0f);
+                SolidBrush keycapFill(Color(PA_PILL(LerpByte(52, 95, hBlend)), 255, 255, 255));
+                Pen keycapPen(Color(PA_PILL(LerpByte(85, 165, hBlend)), 255, 255, 255), 0.9f);
+                g.FillPath(&keycapFill, &keycapPath);
+                g.DrawPath(&keycapPen, &keycapPath);
+
+                std::wstring numStr = std::to_wstring(i + 1);
+                SolidBrush pillTextBrush(Color(PA_PILL(254), 252, 253, 255));
+                g.DrawString(numStr.c_str(), -1, &keycapFont, keycapRect, &centerFmt, &pillTextBrush);
+
                 StringFormat vCenter;
                 vCenter.SetLineAlignment(StringAlignmentCenter);
                 vCenter.SetTrimming(StringTrimmingEllipsisCharacter);
                 vCenter.SetFormatFlags(StringFormatFlagsNoWrap);
 
-                float rightPad = payload.options[i].isLarge ? 32.0f : 16.0f;
-                g.DrawString(optLabel.c_str(), -1, &optFont,
-                             RectF(x + 12.0f, y, w - rightPad, h), &vCenter, &titleBrush);
+                float rightPad = payload.options[i].isLarge ? 56.0f : 38.0f;
+                g.DrawString(payload.options[i].shortSubtitle.c_str(), -1, &optFont,
+                             RectF(x + 34.0f, y, w - rightPad, h), &vCenter, &pillTextBrush);
 
                 if (payload.options[i].isLarge) {
-                    SolidBrush expandHintBrush(Color(CA(LerpByte(130, 240, hBlend)), 150, 210, 255));
+                    SolidBrush expandHintBrush(Color(PA_PILL(LerpByte(165, 250, hBlend)), 180, 225, 255));
                     g.DrawString(L"\x22EF", -1, &optFont,
-                                 RectF(x + w - 24.0f, y, 20.0f, h), &vCenter, &expandHintBrush);
+                                 RectF(x + w - 23.0f, y, 19.0f, h), &vCenter, &expandHintBrush);
                 }
             }
         } else {
-            RectF inputRect(18.0f, cardTopY + 84.0f, static_cast<float>(width - 36), 34.0f);
+            RectF inputRect(18.0f, cardTopY + 83.0f, static_cast<float>(width - 36), 35.0f);
             GraphicsPath inputPath;
-            AddRoundRect(inputPath, inputRect, 10.0f);
+            AddRoundRect(inputPath, inputRect, 11.5f);
 
-            SolidBrush inputFill(Color(CA(45), 255, 255, 255));
+            SolidBrush inputFill(Color(CA(64), 245, 248, 255));
             Pen inputPen(g_anim.replyBoxFocused
-                         ? Color(CA(190), 105, 180, 255)
-                         : Color(CA(50), 255, 255, 255), 1.0f);
+                         ? Color(CA(220), 130, 198, 255)
+                         : Color(CA(92), 255, 255, 255), 1.15f);
             g.FillPath(&inputFill, &inputPath);
             g.DrawPath(&inputPen, &inputPath);
 
@@ -883,21 +1000,21 @@ static void RenderGlassHud(HWND hwnd) {
             StringFormat vCenter;
             vCenter.SetLineAlignment(StringAlignmentCenter);
             g.DrawString(displayReply.c_str(), -1, &bodyFont,
-                         RectF(30.0f, cardTopY + 84.0f, static_cast<float>(width - 60), 34.0f), &vCenter, &textBrush);
+                         RectF(30.0f, cardTopY + 83.0f, static_cast<float>(width - 60), 35.0f), &vCenter, &textBrush);
         }
 
         float popT = std::clamp(g_anim.popoverProgress.value, 0.0f, 1.0f);
         if (popT > 0.01f && !g_anim.popoverBody.empty()) {
             GraphicsState popState = g.Save();
 
-            float popW = static_cast<float>(width - 28);
+            float popW = static_cast<float>(width - 24);
             float popH = static_cast<float>(kPopoverCanvasReservePx - 14);
-            float popX = 14.0f;
-            float popY = 6.0f + (1.0f - popT) * 10.0f;
+            float popX = 12.0f;
+            float popY = 6.0f + (1.0f - popT) * 8.0f;
 
             float originX = std::clamp(g_anim.popoverAnchorX.value, 60.0f, static_cast<float>(width - 60));
             float originY = popY + popH;
-            float popScale = 0.95f + 0.05f * popT;
+            float popScale = 0.96f + 0.04f * popT;
 
             g.TranslateTransform(originX, originY);
             g.ScaleTransform(popScale, popScale);
@@ -909,35 +1026,35 @@ static void RenderGlassHud(HWND hwnd) {
 
             RectF popRect(popX, popY, popW, popH);
             GraphicsPath popPath;
-            AddRoundRect(popPath, popRect, 16.0f);
+            AddRoundRect(popPath, popRect, 18.0f);
 
             LinearGradientBrush popGlass(
                 PointF(0.0f, popY),
                 PointF(0.0f, popY + popH),
-                Color(PA(242), 28, 31, 40),
-                Color(PA(250), 15, 17, 23)
+                Color(PA(228), 64, 72, 94),
+                Color(PA(238), 38, 44, 62)
             );
             g.FillPath(&popGlass, &popPath);
 
             LinearGradientBrush popRim(
                 PointF(0.0f, popY),
                 PointF(0.0f, popY + popH),
-                Color(PA(165), 160, 210, 255),
-                Color(PA(45), 255, 255, 255)
+                Color(PA(215), 255, 255, 255),
+                Color(PA(75), 185, 220, 255)
             );
-            Pen popRimPen(&popRim, 1.25f);
+            Pen popRimPen(&popRim, 1.3f);
             g.DrawPath(&popRimPen, &popPath);
 
-            SolidBrush popHeadingBrush(Color(PA(245), 125, 200, 255));
-            SolidBrush popBodyBrush(Color(PA(248), 245, 247, 252));
+            SolidBrush popHeadingBrush(Color(PA(252), 155, 215, 255));
+            SolidBrush popBodyBrush(Color(PA(252), 250, 252, 255));
 
             g.DrawString(g_anim.popoverHeading.c_str(), -1, &popTitleFont,
-                         PointF(popX + 14.0f, popY + 10.0f), &popHeadingBrush);
+                         PointF(popX + 15.0f, popY + 10.0f), &popHeadingBrush);
 
             StringFormat wrapFmt;
             wrapFmt.SetTrimming(StringTrimmingEllipsisWord);
             g.DrawString(g_anim.popoverBody.c_str(), -1, &popBodyFont,
-                         RectF(popX + 14.0f, popY + 30.0f, popW - 28.0f, popH - 38.0f),
+                         RectF(popX + 15.0f, popY + 30.0f, popW - 30.0f, popH - 38.0f),
                          &wrapFmt, &popBodyBrush);
 
             g.Restore(popState);
@@ -1035,21 +1152,22 @@ static void StepSpringAnimation(HWND hwnd) {
     bool anyMoving = false;
 
     if (!g_anim.isDragging) {
-        if (g_anim.ySpring.Step(dt, 21.5f, g_anim.yZeta)) anyMoving = true;
-        if (g_anim.scaleSpring.Step(dt, 24.0f, 1.0f)) anyMoving = true;
+        if (g_anim.ySpring.Step(dt, 25.0f, g_anim.yZeta)) anyMoving = true;
+        if (g_anim.scaleSpring.Step(dt, 27.0f, 1.0f)) anyMoving = true;
     } else {
         anyMoving = true;
     }
 
-    if (g_anim.opacitySpring.Step(dt, 24.0f, 1.0f)) anyMoving = true;
-    if (g_anim.heightSpring.Step(dt, 23.0f, 1.0f)) anyMoving = true;
-    if (g_anim.contentFadeSpring.Step(dt, 26.0f, 1.0f)) anyMoving = true;
-    if (g_anim.popoverProgress.Step(dt, 30.0f, 1.0f)) anyMoving = true;
-    if (g_anim.popoverAnchorX.Step(dt, 32.0f, 1.0f)) anyMoving = true;
+    if (g_anim.opacitySpring.Step(dt, 28.0f, 1.0f)) anyMoving = true;
+    if (g_anim.heightSpring.Step(dt, 25.0f, 1.0f)) anyMoving = true;
+    if (g_anim.contentFadeSpring.Step(dt, 28.0f, 1.0f)) anyMoving = true;
+    if (g_anim.popoverProgress.Step(dt, 34.0f, 1.0f)) anyMoving = true;
+    if (g_anim.popoverAnchorX.Step(dt, 36.0f, 1.0f)) anyMoving = true;
 
     for (int i = 0; i < 4; ++i) {
-        if (g_anim.pillScale[i].Step(dt, 34.0f, 0.92f)) anyMoving = true;
-        if (g_anim.pillHover[i].Step(dt, 28.0f, 1.0f)) anyMoving = true;
+        if (g_anim.pillScale[i].Step(dt, 36.0f, 0.94f)) anyMoving = true;
+        if (g_anim.pillHover[i].Step(dt, 30.0f, 1.0f)) anyMoving = true;
+        if (g_anim.pillEntrance[i].Step(dt, 26.0f, 1.0f)) anyMoving = true;
     }
 
     RenderGlassHud(hwnd);
@@ -1082,8 +1200,8 @@ static LRESULT CALLBACK GlassHudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 
             bool reduced = IsReducedMotionEnabled();
             if (!g_anim.visible) {
-                g_anim.ySpring.Reset(reduced ? 0.0f : 68.0f, 0.0f, 0.0f);
-                g_anim.scaleSpring.Reset(reduced ? 1.0f : 0.95f, 1.0f, 0.0f);
+                g_anim.ySpring.Reset(reduced ? 0.0f : 56.0f, 0.0f, 0.0f);
+                g_anim.scaleSpring.Reset(reduced ? 1.0f : 0.96f, 1.0f, 0.0f);
                 g_anim.opacitySpring.Reset(0.0f, 1.0f, 0.0f);
                 g_anim.heightSpring.Reset(targetH, targetH, 0.0f);
                 g_anim.contentFadeSpring.Reset(1.0f, 1.0f, 0.0f);
@@ -1092,7 +1210,7 @@ static LRESULT CALLBACK GlassHudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 g_anim.scaleSpring.target = 1.0f;
                 g_anim.opacitySpring.target = 1.0f;
                 g_anim.heightSpring.target = targetH;
-                g_anim.contentFadeSpring.Reset(0.68f, 1.0f, 0.0f);
+                g_anim.contentFadeSpring.Reset(0.75f, 1.0f, 0.0f);
             }
 
             QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&g_anim.showQpc));
@@ -1108,6 +1226,11 @@ static LRESULT CALLBACK GlassHudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             for (int i = 0; i < 4; ++i) {
                 g_anim.pillScale[i].target = 1.0f;
                 g_anim.pillHover[i].target = 0.0f;
+                if (reduced) {
+                    g_anim.pillEntrance[i].Reset(1.0f, 1.0f, 0.0f);
+                } else {
+                    g_anim.pillEntrance[i].Reset(0.0f, 1.0f, -static_cast<float>(i) * 4.2f);
+                }
             }
 
             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -1542,6 +1665,7 @@ static std::wstring GetCurrentExeLabel() {
     if (StrStrIW(filename, L"Cursor")) return L"Cursor";
     if (StrStrIW(filename, L"Code")) return L"VS Code";
     if (StrStrIW(filename, L"Claude")) return L"Claude";
+    if (StrStrIW(filename, L"Codex")) return L"Codex";
     if (StrStrIW(filename, L"WindowsTerminal")) return L"Terminal Agent";
     return filename;
 }
