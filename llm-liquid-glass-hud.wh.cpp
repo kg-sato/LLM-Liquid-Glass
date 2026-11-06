@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              llm-liquid-glass-hud
-// @name            LLM Liquid Glass HUD (Futuristic Robot Buddy & Spotlight Bar)
-// @description     Futuristic Liquid Glass Robot Buddy that pops into the center of your screen with a playful tilt & shake when an LLM finishes, glides with directional motion blur to the top-left for 30s, and brings the finished LLM to the top on click.
-// @version         1.7.0
+// @name            LLM Liquid Glass HUD (Anime Cat Buddy & Spotlight Bar)
+// @description     Cute Anime Cat Buddies (Orange Cat for Claude, Black Cat for Codex, Green Cat for Gemini) that pop up in the very middle of your screen, hover playfully for 2 seconds, then smoothly glide to the top-left corner for 30s. Clicking brings the LLM to the top.
+// @version         1.8.0
 // @author          kg-sato
 // @github          https://github.com/kg-sato/LLM-Liquid-Glass
 // @include         explorer.exe
@@ -21,26 +21,30 @@
 /*
 # LLM Liquid Glass HUD
 
-An Apple-inspired **Futuristic Robot Buddy & Liquid Glass HUD** that automatically surfaces when an LLM or coding agent finishes a cycle.
+An Apple-inspired **Anime Cat Buddy & Liquid Glass HUD** that surfaces when an LLM or coding agent finishes a cycle.
 
 ## Key Features
-- **Futuristic Robot Buddy Mode (Default)**:
-  - Pops into the **center of your screen** out of a soft optical Gaussian blur with an expressive **robot head-tilt, happy visor eyes, and excited shake**.
-  - Smoothly rockets in a curved arc to the **top-left corner** with real-time **velocity-vector directional motion blur**.
-  - Perches in the top-left for **30 seconds** (with zero-gravity hover breathing, cursor-tracking visor eyes, and a luminous 30s countdown halo) before softly blurring and fading away.
-  - **Click Before Timer Runs Out**: Clicking the Robot Buddy at any moment brings the exact LLM window and chat session that just finished to the top.
-- **Classic Spotlight Glass Bar Mode**: Toggle off Robot Buddy Mode in settings anytime to use the full bottom Spotlight bar with inline reply and `1..4` choice buttons.
+- **3 Unique Anime Cat Popups (One per LLM)**:
+  - **Claude (Orange)**: Adorable orange kitten nestled in an orange peel with little leaf and tail (`cat_claude_orange.png`).
+  - **Codex (Black)**: Charming fluffy black kitten with big eyes, red bow collar, and white ruff (`cat_codex_black.png`).
+  - **Gemini / Antigravity (Green)**: Cute lime-green cat with a lychee hairclip and fresh limes (`cat_gemini_green.png`).
+- **Very Middle 2-Second Hover & Top-Left Glide**:
+  - Pops up directly in the **very middle** of your active screen/monitor.
+  - Hovers playfully with gentle head-tilt and breathing bounce for **2.0 seconds**.
+  - Smoothly glides to the **top-left corner** in a zero-gravity hover drift with directional motion blur and optical depth-of-field focus.
+  - Perches in the top-left for **30 seconds** with an orbital countdown halo ring before softly blurring and fading away.
+  - **Click to Focus**: Clicking the cat at any point brings the finished LLM window and exact chat session to the top!
 */
 // ==/WindhawkModReadme==
 
 // ==WindhawkModSettings==
 /*
 - robotBuddyMode: true
-  $name: Futuristic Robot Buddy Icon Mode
-  $description: On (default) = Compact futuristic robot buddy pops into center screen with a tilt and shake, then glides with motion blur to the top-left for 30s (click to bring LLM to top). Off = Full bottom Spotlight glass bar.
+  $name: Anime Cat Buddy Icon Mode
+  $description: On (default) = Cute anime cat buddy pops up in the very middle for 2s (Orange for Claude, Black for Codex, Green for Gemini), then glides to the top-left for 30s (click to bring LLM to top). Off = Full bottom Spotlight glass bar.
 - autoDismissSeconds: 30
   $name: Auto-Dismiss Timeout (seconds)
-  $description: How long the Robot Buddy perches in the top-left before fading away (default 30 seconds).
+  $description: How long the Cat Buddy perches in the top-left before fading away (default 30 seconds).
 - openWindowMode: false
   $name: Open LLM Window on Click (Spotlight Bar Mode)
   $description: Off (default) = Read full summary/options on the HUD and reply inline without leaving your active window. On = Clicking the notification or an option opens and switches to the LLM window and chat.
@@ -365,7 +369,7 @@ struct PointerSample {
 };
 
 static const int kPopoverCanvasReservePx = 152;
-static const int kBuddyCanvasSize = 184;
+static const int kBuddyCanvasSize = 220;
 
 struct HudChoreography {
     Spring1D ySpring;
@@ -1033,6 +1037,66 @@ static void ApplyDirectionalMotionBlur(uint32_t* pixels, int w, int h, float vx,
     }
 }
 
+enum class LLMBrand {
+    Claude_Orange,
+    Codex_Black,
+    Gemini_Green
+};
+
+static LLMBrand DetectLLMBrand(const LLMCyclePayload& payload) {
+    std::wstring combined = payload.sourceApp + L" " + payload.title + L" " + payload.modelBadge;
+    if (StrStrIW(combined.c_str(), L"Claude")) {
+        return LLMBrand::Claude_Orange;
+    }
+    if (StrStrIW(combined.c_str(), L"Codex") || StrStrIW(combined.c_str(), L"codex")) {
+        return LLMBrand::Codex_Black;
+    }
+    return LLMBrand::Gemini_Green;
+}
+
+static Bitmap* g_catClaudeOrange = nullptr;
+static Bitmap* g_catCodexBlack = nullptr;
+static Bitmap* g_catGeminiGreen = nullptr;
+static std::mutex g_catBitmapMutex;
+
+static Bitmap* LoadCatBitmap(const std::wstring& filename) {
+    wchar_t userProfile[MAX_PATH] = {};
+    if (GetEnvironmentVariableW(L"USERPROFILE", userProfile, MAX_PATH) == 0) {
+        return nullptr;
+    }
+    std::wstring fullPath = std::wstring(userProfile) +
+        L"\\.gemini\\antigravity\\scratch\\windhawk-llm-glass-hud\\assets\\" + filename;
+    Bitmap* bmp = Bitmap::FromFile(fullPath.c_str());
+    if (bmp && bmp->GetLastStatus() == Ok) {
+        return bmp;
+    }
+    if (bmp) delete bmp;
+    return nullptr;
+}
+
+static Bitmap* GetCatBitmapForBrand(LLMBrand brand) {
+    std::lock_guard<std::mutex> lock(g_catBitmapMutex);
+    switch (brand) {
+        case LLMBrand::Claude_Orange:
+            if (!g_catClaudeOrange) g_catClaudeOrange = LoadCatBitmap(L"cat_claude_orange.png");
+            return g_catClaudeOrange;
+        case LLMBrand::Codex_Black:
+            if (!g_catCodexBlack) g_catCodexBlack = LoadCatBitmap(L"cat_codex_black.png");
+            return g_catCodexBlack;
+        case LLMBrand::Gemini_Green:
+        default:
+            if (!g_catGeminiGreen) g_catGeminiGreen = LoadCatBitmap(L"cat_gemini_green.png");
+            return g_catGeminiGreen;
+    }
+}
+
+static void FreeCatBitmaps() {
+    std::lock_guard<std::mutex> lock(g_catBitmapMutex);
+    if (g_catClaudeOrange) { delete g_catClaudeOrange; g_catClaudeOrange = nullptr; }
+    if (g_catCodexBlack) { delete g_catCodexBlack; g_catCodexBlack = nullptr; }
+    if (g_catGeminiGreen) { delete g_catGeminiGreen; g_catGeminiGreen = nullptr; }
+}
+
 static void RenderRobotBuddyHud(HWND hwnd, const LLMCyclePayload& payload) {
     const int size = kBuddyCanvasSize;
     LONGLONG nowQpc = 0;
@@ -1046,15 +1110,23 @@ static void RenderRobotBuddyHud(HWND hwnd, const LLMCyclePayload& payload) {
     float s = std::clamp(g_anim.buddyScaleSpring.value, 0.55f, 1.28f);
     float hoverT = std::clamp(g_anim.buddyHoverSpring.value, 0.0f, 1.0f);
 
-    // Theme-adaptive neon palette per LLM agent
-    Color neonPrimary(255, 82, 232, 255);   // Electric Cyan default
-    Color neonSecondary(255, 120, 148, 255); // Indigo glow
-    if (StrStrIW(payload.sourceApp.c_str(), L"Claude")) {
-        neonPrimary = Color(255, 96, 238, 255);
-        neonSecondary = Color(255, 255, 152, 108); // Warm Claude coral-amber accent
-    } else if (StrStrIW(payload.sourceApp.c_str(), L"Codex")) {
-        neonPrimary = Color(255, 68, 248, 178);    // Cyber Emerald
-        neonSecondary = Color(255, 76, 210, 255);
+    LLMBrand brand = DetectLLMBrand(payload);
+
+    // Three distinct branded palettes per LLM:
+    // Claude: Warm sunny orange & peach glow
+    // Codex: Sleek crimson red ribbon & cyberpunk violet aura
+    // Gemini: Fresh vibrant lime-green & mint glow
+    Color neonPrimary(255, 255, 142, 58);
+    Color neonSecondary(255, 255, 195, 120);
+    std::wstring brandName = L"Claude";
+    if (brand == LLMBrand::Codex_Black) {
+        neonPrimary = Color(255, 255, 62, 84);
+        neonSecondary = Color(255, 192, 142, 255);
+        brandName = L"Codex";
+    } else if (brand == LLMBrand::Gemini_Green) {
+        neonPrimary = Color(255, 92, 235, 130);
+        neonSecondary = Color(255, 175, 255, 192);
+        brandName = StrStrIW(payload.sourceApp.c_str(), L"Antigravity") ? L"Antigravity" : L"Gemini";
     }
 
     HDC hdcScreen = GetDC(nullptr);
@@ -1083,219 +1155,110 @@ static void RenderRobotBuddyHud(HWND hwnd, const LLMCyclePayload& payload) {
         };
 
         float cx = size * 0.5f + g_anim.buddyShakeX;
-        float cy = size * 0.5f - 6.0f + g_anim.buddyHopY;
-
-        // Zero-gravity hover breathing once perched in the top-left
-        if (elapsedSec > 1.25f && !g_anim.isDragging) {
-            cy += std::sin((elapsedSec - 1.25f) * 2.7f) * 2.8f;
-        }
+        float cy = size * 0.5f - 8.0f + g_anim.buddyHopY;
 
         g.TranslateTransform(cx, cy);
         g.ScaleTransform(s, s);
 
-        // 1. Soft multi-ring ambient bloom aura behind the Robot Buddy
+        // 1. Soft multi-ring ambient bloom aura in the brand color
         for (int ring = 4; ring >= 1; --ring) {
-            float r = 38.0f + ring * 8.5f + hoverT * 4.0f;
-            int ringAlpha = (5 - ring) * (hoverT > 0.1f ? 13 : 9);
+            float r = 44.0f + ring * 9.0f + hoverT * 5.0f;
+            int ringAlpha = (5 - ring) * (hoverT > 0.1f ? 14 : 9);
             SolidBrush auraBrush(Color(A(ringAlpha), neonPrimary.GetR(), neonPrimary.GetG(), neonPrimary.GetB()));
             g.FillEllipse(&auraBrush, -r, -r, r * 2.0f, r * 2.0f);
         }
 
-        // Expanding sonar pulse ring during the center-screen pop-in greeting (0.05s .. 0.95s)
+        // Expanding sonar pulse ring on initial middle pop-in (0.04s .. 0.95s)
         if (elapsedSec > 0.04f && elapsedSec < 0.98f) {
             float pulseT = std::clamp((elapsedSec - 0.04f) / 0.88f, 0.0f, 1.0f);
             float pulseEase = 1.0f - std::pow(1.0f - pulseT, 3.0f);
-            float pulseR = 34.0f + pulseEase * 44.0f;
-            BYTE pulseAlpha = A(static_cast<int>((1.0f - pulseT) * 165.0f));
+            float pulseR = 40.0f + pulseEase * 50.0f;
+            BYTE pulseAlpha = A(static_cast<int>((1.0f - pulseT) * 160.0f));
             Pen sonarPen(Color(pulseAlpha, neonPrimary.GetR(), neonPrimary.GetG(), neonPrimary.GetB()), 2.2f * (1.0f - pulseT * 0.5f));
             g.DrawEllipse(&sonarPen, -pulseR, -pulseR, pulseR * 2.0f, pulseR * 2.0f);
         }
 
-        // 2. Frosted Liquid Glass Orbital Backing Disc + 30s Countdown Halo Ring
-        float discR = 44.0f;
+        // 2. Frosted Apple Liquid Glass Orbital Disc Backing
+        float discR = 64.0f;
         LinearGradientBrush discFill(
             PointF(0.0f, -discR),
             PointF(0.0f, discR),
-            Color(A(188), 54, 62, 84),
-            Color(A(212), 28, 34, 50)
+            Color(A(175), 48, 54, 76),
+            Color(A(205), 24, 28, 42)
         );
         g.FillEllipse(&discFill, -discR, -discR, discR * 2.0f, discR * 2.0f);
 
-        // Inner top frost sheen on the glass disc
+        // Inner top frost sheen
         LinearGradientBrush discSheen(
             PointF(0.0f, -discR),
-            PointF(0.0f, 4.0f),
-            Color(A(62), 240, 248, 255),
+            PointF(0.0f, 6.0f),
+            Color(A(55), 240, 248, 255),
             Color(A(0), 240, 248, 255)
         );
-        g.FillEllipse(&discSheen, -(discR - 1.5f), -(discR - 1.5f), (discR - 1.5f) * 2.0f, (discR - 1.5f) * 1.4f);
+        g.FillEllipse(&discSheen, -(discR - 1.5f), -(discR - 1.5f), (discR - 1.5f) * 2.0f, (discR - 1.5f) * 1.35f);
 
-        // Subtle track ring + 30-second countdown progress arc around the perimeter
-        Pen trackPen(Color(A(68), 220, 235, 255), 2.2f);
+        // Crisp specular glass rim
+        Pen discRimPen(Color(A(185), 255, 255, 255), 1.25f);
+        g.DrawEllipse(&discRimPen, -discR, -discR, discR * 2.0f, discR * 2.0f);
+
+        // Subtle perimeter track ring + 30-second countdown halo arc
+        Pen trackPen(Color(A(50), 220, 235, 255), 2.4f);
         g.DrawEllipse(&trackPen, -discR, -discR, discR * 2.0f, discR * 2.0f);
 
         float remainFrac = 1.0f;
-        if (elapsedSec > 1.05f) {
-            remainFrac = std::clamp(1.0f - (elapsedSec - 1.05f) / totalDuration, 0.0f, 1.0f);
+        if (elapsedSec > 2.0f) {
+            remainFrac = std::clamp(1.0f - (elapsedSec - 2.0f) / totalDuration, 0.0f, 1.0f);
         }
         Color arcColor = (remainFrac < 0.18f)
-            ? Color(A(235), 255, 168, 84)
-            : Color(A(225), neonPrimary.GetR(), neonPrimary.GetG(), neonPrimary.GetB());
-        Pen countdownPen(arcColor, 2.6f);
+            ? Color(A(240), 255, 160, 75)
+            : Color(A(235), neonPrimary.GetR(), neonPrimary.GetG(), neonPrimary.GetB());
+        Pen countdownPen(arcColor, 2.8f);
         countdownPen.SetStartCap(LineCapRound);
         countdownPen.SetEndCap(LineCapRound);
         g.DrawArc(&countdownPen, -discR, -discR, discR * 2.0f, discR * 2.0f, -90.0f, remainFrac * 360.0f);
 
-        // 3. Rotate the Robot Buddy Head & Chassis by the dynamic tilt/shake/bank angle
-        GraphicsState headState = g.Save();
+        // 3. Playful Head-Tilt & Hover Rotation of the Main Cat
+        GraphicsState catState = g.Save();
         float tiltDeg = g_anim.buddyTiltSpring.value;
         g.RotateTransform(tiltDeg);
 
-        // Floating Telemetry Antenna at top of head (with secondary spring overlap)
-        float antennaLagDeg = std::clamp(tiltDeg * 0.35f, -12.0f, 12.0f);
-        float antTopY = -36.5f - (elapsedSec < 0.9f ? 3.0f * std::sin(elapsedSec * 14.0f) : 0.0f);
-        Pen antStemPen(Color(A(220), 210, 226, 250), 2.4f);
-        antStemPen.SetStartCap(LineCapRound);
-        g.DrawLine(&antStemPen, PointF(0.0f, -24.0f), PointF(antennaLagDeg * 0.35f, antTopY));
-
-        float orbX = antennaLagDeg * 0.35f;
-        SolidBrush antGlowBrush(Color(A(115), neonSecondary.GetR(), neonSecondary.GetG(), neonSecondary.GetB()));
-        g.FillEllipse(&antGlowBrush, orbX - 7.5f, antTopY - 7.5f, 15.0f, 15.0f);
-        SolidBrush antCoreBrush(Color(A(255), 255, 250, 255));
-        g.FillEllipse(&antCoreBrush, orbX - 3.6f, antTopY - 3.6f, 7.2f, 7.2f);
-
-        // Side Acoustic Ear-Pods (shift slightly with head tilt parallax)
-        float earShiftY = tiltDeg * 0.08f;
-        RectF leftEar(-35.5f, -9.0f - earShiftY, 7.5f, 18.0f);
-        RectF rightEar(28.0f, -9.0f + earShiftY, 7.5f, 18.0f);
-        GraphicsPath earsPath;
-        AddRoundRect(earsPath, leftEar, 3.6f);
-        AddRoundRect(earsPath, rightEar, 3.6f);
-        SolidBrush earBrush(Color(A(235), 185, 202, 232));
-        Pen earRimPen(Color(A(180), 255, 255, 255), 1.0f);
-        g.FillPath(&earBrush, &earsPath);
-        g.DrawPath(&earRimPen, &earsPath);
-
-        // Outer Futuristic Robot Head Shell (Pearlescent Titanium + Liquid Glass Squircle)
-        RectF headRect(-30.0f, -24.0f, 60.0f, 48.0f);
-        GraphicsPath headPath;
-        AddRoundRect(headPath, headRect, 20.0f);
-
-        LinearGradientBrush headBodyBrush(
-            PointF(0.0f, -24.0f),
-            PointF(0.0f, 24.0f),
-            Color(A(252), 248, 251, 255),
-            Color(A(246), 192, 208, 236)
-        );
-        g.FillPath(&headBodyBrush, &headPath);
-
-        // Crisp icy specular rim around the robot head
-        Pen headRimPen(Color(A(250), 255, 255, 255), 1.6f);
-        g.DrawPath(&headRimPen, &headPath);
-
-        // Recessed Deep-Space Obsidian Glass Visor
-        RectF visorRect(-23.5f, -15.5f, 47.0f, 30.0f);
-        GraphicsPath visorPath;
-        AddRoundRect(visorPath, visorRect, 13.5f);
-        LinearGradientBrush visorBrush(
-            PointF(0.0f, -15.5f),
-            PointF(0.0f, 14.5f),
-            Color(A(252), 16, 22, 38),
-            Color(A(254), 26, 36, 62)
-        );
-        Pen visorRimPen(Color(A(140), 120, 175, 245), 1.15f);
-        g.FillPath(&visorBrush, &visorPath);
-        g.DrawPath(&visorRimPen, &visorPath);
-
-        // Subtle diagonal glass reflection across the top-left of the visor
-        GraphicsPath visorGlint;
-        AddRoundRect(visorGlint, RectF(-20.0f, -13.0f, 26.0f, 7.5f), 3.7f);
-        LinearGradientBrush glintBrush(
-            PointF(-20.0f, -13.0f),
-            PointF(6.0f, -5.5f),
-            Color(A(58), 255, 255, 255),
-            Color(A(0), 255, 255, 255)
-        );
-        g.FillPath(&glintBrush, &visorGlint);
-
-        // 4. Expressive Glowing Robot Eyes inside the Visor
-        // Happy excited arc eyes (^  ^) during the center pop-in shake or when hovered!
-        bool happySquint = (elapsedSec >= 0.14f && elapsedSec <= 0.86f) || (hoverT > 0.35f);
-
-        // Eye pupil tracking toward the mouse cursor when perched
-        POINT cursorPt = {};
-        GetCursorPos(&cursorPt);
-        RECT wndRc = {};
-        GetWindowRect(hwnd, &wndRc);
-        float wndCenterX = (wndRc.left + wndRc.right) * 0.5f;
-        float wndCenterY = (wndRc.top + wndRc.bottom) * 0.5f;
-        float lookX = std::clamp((cursorPt.x - wndCenterX) * 0.012f, -3.4f, 3.4f);
-        float lookY = std::clamp((cursorPt.y - wndCenterY) * 0.010f, -2.0f, 2.0f);
-
-        // Natural periodic blink every ~4.1s
-        float blinkCycle = std::fmod(elapsedSec + 1.8f, 4.1f);
-        float eyeOpenScale = 1.0f;
-        if (blinkCycle > 3.92f) {
-            float bt = (blinkCycle - 3.92f) / 0.18f;
-            eyeOpenScale = std::max(0.12f, std::fabs(std::cos(bt * 3.14159265f)));
+        // Render the transparent segmented Cat Bitmap
+        Bitmap* pCatBmp = GetCatBitmapForBrand(brand);
+        if (pCatBmp) {
+            g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+            float bw = static_cast<float>(pCatBmp->GetWidth());
+            float bh = static_cast<float>(pCatBmp->GetHeight());
+            float targetSize = 126.0f;
+            float aspect = (bh > 0.0f) ? (bw / bh) : 1.0f;
+            float drawW = (aspect >= 1.0f) ? targetSize : targetSize * aspect;
+            float drawH = (aspect >= 1.0f) ? (targetSize / aspect) : targetSize;
+            RectF catRect(-drawW * 0.5f, -drawH * 0.5f - 3.0f, drawW, drawH);
+            g.DrawImage(pCatBmp, catRect, 0, 0, bw, bh, UnitPixel);
         }
 
-        SolidBrush eyeGlowBrush(Color(A(95), neonPrimary.GetR(), neonPrimary.GetG(), neonPrimary.GetB()));
-        SolidBrush eyeCoreBrush(Color(A(255), 215, 252, 255));
-        Pen happyArcPen(Color(A(255), 205, 252, 255), 3.1f);
-        happyArcPen.SetStartCap(LineCapRound);
-        happyArcPen.SetEndCap(LineCapRound);
-        Pen happyGlowPen(Color(A(105), neonPrimary.GetR(), neonPrimary.GetG(), neonPrimary.GetB()), 6.2f);
-        happyGlowPen.SetStartCap(LineCapRound);
-        happyGlowPen.SetEndCap(LineCapRound);
+        g.Restore(catState);
 
-        float leftEyeX = -10.5f + lookX;
-        float rightEyeX = 10.5f + lookX;
-        float eyeY = -1.0f + lookY;
-
-        if (happySquint) {
-            // Excited happy robot eye arcs (^   ^)
-            g.DrawArc(&happyGlowPen, leftEyeX - 6.0f, eyeY - 5.0f, 12.0f, 11.0f, 195.0f, 150.0f);
-            g.DrawArc(&happyGlowPen, rightEyeX - 6.0f, eyeY - 5.0f, 12.0f, 11.0f, 195.0f, 150.0f);
-            g.DrawArc(&happyArcPen, leftEyeX - 6.0f, eyeY - 5.0f, 12.0f, 11.0f, 195.0f, 150.0f);
-            g.DrawArc(&happyArcPen, rightEyeX - 6.0f, eyeY - 5.0f, 12.0f, 11.0f, 195.0f, 150.0f);
-        } else {
-            float eyeW = 7.6f;
-            float eyeH = std::max(2.0f, 11.4f * eyeOpenScale);
-            RectF lGlow(leftEyeX - eyeW * 0.5f - 2.5f, eyeY - eyeH * 0.5f - 2.5f, eyeW + 5.0f, eyeH + 5.0f);
-            RectF rGlow(rightEyeX - eyeW * 0.5f - 2.5f, eyeY - eyeH * 0.5f - 2.5f, eyeW + 5.0f, eyeH + 5.0f);
-            g.FillEllipse(&eyeGlowBrush, lGlow);
-            g.FillEllipse(&eyeGlowBrush, rGlow);
-
-            GraphicsPath eyesPath;
-            AddRoundRect(eyesPath, RectF(leftEyeX - eyeW * 0.5f, eyeY - eyeH * 0.5f, eyeW, eyeH), eyeW * 0.48f);
-            AddRoundRect(eyesPath, RectF(rightEyeX - eyeW * 0.5f, eyeY - eyeH * 0.5f, eyeW, eyeH), eyeW * 0.48f);
-            g.FillPath(&eyeCoreBrush, &eyesPath);
-        }
-
-        g.Restore(headState);
-
-        // 5. Sleek Floating Micro-Title Pill below the Robot Buddy (tilts gently at 40% of head tilt)
+        // 4. Sleek Floating Micro-Title Pill below the Cat Buddy
         GraphicsState pillState = g.Save();
-        g.RotateTransform(tiltDeg * 0.38f);
+        g.RotateTransform(tiltDeg * 0.35f);
 
         FontFamily fontFamily(L"Segoe UI Variable Display");
         FontFamily fallbackFamily(L"Segoe UI");
         const FontFamily* fam = fontFamily.IsAvailable() ? &fontFamily : &fallbackFamily;
-        Font labelFont(fam, 10.5f, FontStyleBold, UnitPixel);
+        Font labelFont(fam, 11.0f, FontStyleBold, UnitPixel);
 
         std::wstring badgeLabel = (hoverT > 0.35f)
-            ? (L"Open " + payload.sourceApp + L" \x2192")
-            : (payload.sourceApp + L" \x00B7 Ready");
-        if (badgeLabel.size() > 18) {
-            badgeLabel = badgeLabel.substr(0, 17) + L"\x2026";
+            ? (L"Open " + brandName + L" \x2192")
+            : (brandName + L" \x00B7 Ready");
+        if (badgeLabel.size() > 20) {
+            badgeLabel = badgeLabel.substr(0, 19) + L"\x2026";
         }
 
-        RectF labelPillRect(-56.0f, 34.0f, 112.0f, 20.0f);
+        RectF labelPillRect(-58.0f, 45.0f, 116.0f, 21.0f);
         GraphicsPath labelPillPath;
-        AddRoundRect(labelPillPath, labelPillRect, 10.0f);
-        SolidBrush labelFill(Color(A(210), 30, 38, 58));
-        Pen labelPen(Color(A(165), neonPrimary.GetR(), neonPrimary.GetG(), neonPrimary.GetB()), 1.1f);
+        AddRoundRect(labelPillPath, labelPillRect, 10.5f);
+        SolidBrush labelFill(Color(A(215), 26, 32, 48));
+        Pen labelPen(Color(A(175), neonPrimary.GetR(), neonPrimary.GetG(), neonPrimary.GetB()), 1.15f);
         g.FillPath(&labelFill, &labelPillPath);
         g.DrawPath(&labelPen, &labelPillPath);
 
@@ -1303,7 +1266,7 @@ static void RenderRobotBuddyHud(HWND hwnd, const LLMCyclePayload& payload) {
         centerFmt.SetAlignment(StringAlignmentCenter);
         centerFmt.SetLineAlignment(StringAlignmentCenter);
         centerFmt.SetFormatFlags(StringFormatFlagsNoWrap);
-        SolidBrush labelTextBrush(Color(A(252), 245, 250, 255));
+        SolidBrush labelTextBrush(Color(A(254), 248, 252, 255));
         g.DrawString(badgeLabel.c_str(), -1, &labelFont, labelPillRect, &centerFmt, &labelTextBrush);
 
         g.Restore(pillState);
@@ -1825,68 +1788,73 @@ static void StepSpringAnimation(HWND hwnd) {
 
         if (!g_anim.dismissing) {
             if (!g_anim.buddyLaunchedToCorner) {
-                // Phase 1 (0.0s .. 1.05s): Center-Screen Pop-In + Futuristic Robot Head Tilt & Excited Shake
-                if (!reduced && elapsedSec >= 0.06f && elapsedSec < 0.92f) {
-                    float tNorm = std::clamp((elapsedSec - 0.06f) / 0.86f, 0.0f, 1.0f);
-                    float env = std::sin(tNorm * 3.14159265f);
-                    g_anim.buddyTiltSpring.target = env * 21.0f * std::sin((elapsedSec - 0.06f) * 25.0f);
-                    g_anim.buddyShakeX = env * 6.5f * std::cos((elapsedSec - 0.06f) * 25.0f);
-                    g_anim.buddyHopY = -env * 9.5f * std::fabs(std::sin((elapsedSec - 0.06f) * 12.5f));
+                // Phase 1 (0.0s .. 2.0s): Stay in the Very Middle + Playful Floating Hover & Gentle Head-Tilt
+                if (!reduced && elapsedSec < 2.0f) {
+                    float bobSpeed = 4.8f;
+                    g_anim.buddyTiltSpring.target = std::sin(elapsedSec * bobSpeed) * 5.8f;
+                    g_anim.buddyShakeX = 0.0f;
+                    g_anim.buddyHopY = -std::fabs(std::sin(elapsedSec * 5.2f)) * 4.2f;
                 } else {
                     g_anim.buddyTiltSpring.target = 0.0f;
                     g_anim.buddyShakeX = 0.0f;
                     g_anim.buddyHopY = 0.0f;
                 }
 
-                // Settle scale after initial pop overshoot
-                if (elapsedSec > 0.18f) {
+                // Settle scale after initial pop
+                if (elapsedSec > 0.22f) {
                     g_anim.buddyScaleSpring.target = 1.0f;
                 }
 
-                // Phase 2 (t >= 1.05s): Launch smoothly from Center Screen to Top-Left Corner
-                if (elapsedSec >= (reduced ? 0.45f : 1.05f)) {
+                // Phase 2 (t >= 2.0s): Smoothly glide to the Top-Left Corner in a graceful hover move
+                if (elapsedSec >= (reduced ? 0.6f : 2.0f)) {
                     g_anim.buddyLaunchedToCorner = true;
                     g_anim.buddyXSpring.target = g_anim.buddyCornerX;
                     g_anim.buddyYSpring.target = g_anim.buddyCornerY;
                     if (!reduced) {
-                        // Swooping upward-left arc impulse
-                        g_anim.buddyYSpring.velocity -= 290.0f;
-                        g_anim.buddyXSpring.velocity -= 160.0f;
+                        // Gentle buoyant hover lift impulse
+                        g_anim.buddyYSpring.velocity -= 130.0f;
+                        g_anim.buddyXSpring.velocity -= 80.0f;
                     }
-                    g_anim.buddyScaleSpring.target = 0.88f;
+                    g_anim.buddyScaleSpring.target = 0.90f;
                     g_anim.buddyShakeX = 0.0f;
                     g_anim.buddyHopY = 0.0f;
                 }
             } else {
-                // In-flight aerodynamic bank tilt + top-left perch idle attitude
+                // In-flight gentle hover banking & top-left perch breathing
                 float vx = g_anim.buddyXSpring.velocity;
                 float vy = g_anim.buddyYSpring.velocity;
                 float speed = std::sqrt(vx * vx + vy * vy);
-                if (speed > 60.0f && !reduced) {
-                    g_anim.buddyTiltSpring.target = std::clamp(vx * 0.016f, -22.0f, 22.0f);
+                if (speed > 35.0f && !reduced) {
+                    g_anim.buddyTiltSpring.target = std::clamp(vx * 0.012f, -14.0f, 14.0f);
+                    // Floating undulation during hover glide
+                    g_anim.buddyHopY = std::sin((elapsedSec - 2.0f) * 6.2f) * 3.5f;
                 } else {
-                    float idleTilt = (!reduced && elapsedSec > 1.8f)
-                        ? std::sin((elapsedSec - 1.8f) * 1.5f) * 2.4f
+                    float idleBob = (!reduced && elapsedSec > 2.8f)
+                        ? std::sin((elapsedSec - 2.8f) * 2.2f) * 3.5f
                         : 0.0f;
-                    g_anim.buddyTiltSpring.target = g_anim.buddyHovered ? 8.5f : idleTilt;
+                    g_anim.buddyHopY = idleBob;
+                    float idleTilt = (!reduced && elapsedSec > 2.8f)
+                        ? std::sin((elapsedSec - 2.8f) * 1.5f) * 2.2f
+                        : 0.0f;
+                    g_anim.buddyTiltSpring.target = g_anim.buddyHovered ? 6.5f : idleTilt;
                 }
-                g_anim.buddyScaleSpring.target = g_anim.buddyHovered ? 0.98f : 0.88f;
+                g_anim.buddyScaleSpring.target = g_anim.buddyHovered ? 1.04f : 0.90f;
             }
         }
 
         if (!g_anim.isDragging) {
-            g_anim.buddyXSpring.Step(dt, 9.8f, 0.88f);
-            g_anim.buddyYSpring.Step(dt, 9.8f, 0.88f);
+            g_anim.buddyXSpring.Step(dt, 6.2f, 0.92f);
+            g_anim.buddyYSpring.Step(dt, 6.2f, 0.92f);
         }
-        g_anim.buddyScaleSpring.Step(dt, 30.0f, 0.72f);
+        g_anim.buddyScaleSpring.Step(dt, 26.0f, 0.78f);
         bool opMoving = g_anim.buddyOpacitySpring.Step(dt, 24.0f, 1.0f);
-        g_anim.buddyTiltSpring.Step(dt, 38.0f, 0.76f);
+        g_anim.buddyTiltSpring.Step(dt, 32.0f, 0.82f);
         g_anim.buddyBlurSpring.Step(dt, 26.0f, 1.0f);
         g_anim.buddyHoverSpring.Step(dt, 30.0f, 1.0f);
 
         RenderGlassHud(hwnd);
 
-        // Keep animation loop alive while visible in Robot Buddy mode (for 30s countdown ring, eye tracking & hover bob)
+        // Keep animation loop alive while visible in Robot Buddy mode (for 30s countdown ring & hover bob)
         if (g_anim.dismissing && !opMoving && g_anim.buddyOpacitySpring.value <= 0.01f) {
             KillTimer(hwnd, TIMER_SPRING_FRAME);
             g_anim.lastFrameQpc = 0;
@@ -1974,21 +1942,21 @@ static LRESULT CALLBACK GlassHudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             float monW = static_cast<float>(monRc.right - monRc.left);
             float monH = static_cast<float>(monRc.bottom - monRc.top);
             g_anim.buddyCenterX = static_cast<float>(monRc.left) + (monW - kBuddyCanvasSize) * 0.5f;
-            g_anim.buddyCenterY = static_cast<float>(monRc.top) + (monH - kBuddyCanvasSize) * 0.44f;
+            g_anim.buddyCenterY = static_cast<float>(monRc.top) + (monH - kBuddyCanvasSize) * 0.5f;
             if (g_anim.hasCustomBuddyPerch) {
                 g_anim.buddyCornerX = g_anim.customBuddyPerchX;
                 g_anim.buddyCornerY = g_anim.customBuddyPerchY;
             } else {
-                g_anim.buddyCornerX = static_cast<float>(monRc.left) + 20.0f;
-                g_anim.buddyCornerY = static_cast<float>(monRc.top) + 20.0f;
+                g_anim.buddyCornerX = static_cast<float>(monRc.left) + 24.0f;
+                g_anim.buddyCornerY = static_cast<float>(monRc.top) + 24.0f;
             }
 
             g_anim.buddyXSpring.Reset(g_anim.buddyCenterX, g_anim.buddyCenterX, 0.0f);
             g_anim.buddyYSpring.Reset(g_anim.buddyCenterY, g_anim.buddyCenterY, 0.0f);
-            g_anim.buddyScaleSpring.Reset(reduced ? 1.0f : 0.82f, reduced ? 1.0f : 1.08f, reduced ? 0.0f : 4.2f);
+            g_anim.buddyScaleSpring.Reset(reduced ? 1.0f : 0.82f, reduced ? 1.0f : 1.06f, reduced ? 0.0f : 3.8f);
             g_anim.buddyOpacitySpring.Reset(0.0f, 1.0f, 0.0f);
-            g_anim.buddyBlurSpring.Reset(reduced ? 0.0f : 8.5f, 0.0f, 0.0f);
-            g_anim.buddyTiltSpring.Reset(reduced ? 0.0f : -16.0f, 0.0f, 0.0f);
+            g_anim.buddyBlurSpring.Reset(reduced ? 0.0f : 8.0f, 0.0f, 0.0f);
+            g_anim.buddyTiltSpring.Reset(0.0f, 0.0f, 0.0f);
             g_anim.buddyHoverSpring.Reset(0.0f, 0.0f, 0.0f);
             g_anim.buddyShakeX = 0.0f;
             g_anim.buddyHopY = 0.0f;
@@ -2046,7 +2014,7 @@ static LRESULT CALLBACK GlassHudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             }
             if (dismissSec > 0) {
                 UINT timeoutMs = static_cast<UINT>(std::clamp(dismissSec, 3, 300) * 1000) +
-                                 (g_settings.robotBuddyMode ? 1100u : 0u);
+                                 (g_settings.robotBuddyMode ? 2000u : 0u);
                 SetTimer(hwnd, TIMER_AUTO_DISMISS, timeoutMs, nullptr);
             }
             return 0;
@@ -2579,6 +2547,7 @@ static DWORD WINAPI HudHostThreadProc(LPVOID) {
     }
 
     UnregisterClassW(kHudClassName, wc.hInstance);
+    FreeCatBitmaps();
     GdiplusShutdown(g_gdiplusToken);
     return 0;
 }
