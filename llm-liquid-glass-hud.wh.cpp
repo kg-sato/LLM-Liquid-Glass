@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              llm-liquid-glass-hud
-// @name            LLM Liquid Glass HUD (Apple Spotlight & Dynamic Notification)
-// @description     Apple Liquid Glass floating HUD near the taskbar that pops up when an LLM finishes a cycle, displays interactive multiple-choice options or summary text, and lets you reply/select without leaving your active window.
-// @version         1.6.0
+// @name            LLM Liquid Glass HUD (Futuristic Robot Buddy & Spotlight Bar)
+// @description     Futuristic Liquid Glass Robot Buddy that pops into the center of your screen with a playful tilt & shake when an LLM finishes, glides with directional motion blur to the top-left for 30s, and brings the finished LLM to the top on click.
+// @version         1.7.0
 // @author          kg-sato
 // @github          https://github.com/kg-sato/LLM-Liquid-Glass
 // @include         explorer.exe
@@ -21,24 +21,28 @@
 /*
 # LLM Liquid Glass HUD
 
-An Apple-inspired **Liquid Glass floating HUD** positioned near the bottom taskbar (Spotlight / visionOS style) that automatically surfaces when an LLM or coding agent finishes a cycle.
+An Apple-inspired **Futuristic Robot Buddy & Liquid Glass HUD** that automatically surfaces when an LLM or coding agent finishes a cycle.
 
 ## Key Features
-- **Luminous Apple Liquid Glass Material**: Uses a bright, frosted visionOS / macOS Tahoe translucent glass palette with top-edge light-catch specular highlights, inner frost sheen, and crisp glass keycap badges.
-- **Context-Aware Choice Extraction**: Distinguishes genuine user-selectable options (`AskUserQuestion`, `request_user_input`, or explicit decision prompts) from ordinary numbered status lists.
-- **Smart Compact Labels & Instant Hover Popover for Large LLM Outputs**:
-  - When an LLM provides a long option or multi-sentence description, the button automatically displays the concise **subtitle/heading** with a subtle `⋯` indicator.
-  - Hovering any truncated option pill or long summary description springs open an **origin-aware Apple Liquid Glass Popover** above the HUD showing the full multi-line text.
-  - Supports Emil Kowalski's **instant neighbour tooltip rule**: once the hover popover is open, moving across adjacent options updates and repositions it immediately with zero re-entry delay.
-- **Automatic Multi-Agent Detection**:
-  - Automatically launches `tools/agy_stop_hook.py --watch` and hooks `FlashWindowEx` and `Shell_NotifyIconW` across Antigravity, Claude Code / Claude Desktop, Codex, Cursor, VS Code, and Windows Terminal.
+- **Futuristic Robot Buddy Mode (Default)**:
+  - Pops into the **center of your screen** out of a soft optical Gaussian blur with an expressive **robot head-tilt, happy visor eyes, and excited shake**.
+  - Smoothly rockets in a curved arc to the **top-left corner** with real-time **velocity-vector directional motion blur**.
+  - Perches in the top-left for **30 seconds** (with zero-gravity hover breathing, cursor-tracking visor eyes, and a luminous 30s countdown halo) before softly blurring and fading away.
+  - **Click Before Timer Runs Out**: Clicking the Robot Buddy at any moment brings the exact LLM window and chat session that just finished to the top.
+- **Classic Spotlight Glass Bar Mode**: Toggle off Robot Buddy Mode in settings anytime to use the full bottom Spotlight bar with inline reply and `1..4` choice buttons.
 */
 // ==/WindhawkModReadme==
 
 // ==WindhawkModSettings==
 /*
+- robotBuddyMode: true
+  $name: Futuristic Robot Buddy Icon Mode
+  $description: On (default) = Compact futuristic robot buddy pops into center screen with a tilt and shake, then glides with motion blur to the top-left for 30s (click to bring LLM to top). Off = Full bottom Spotlight glass bar.
+- autoDismissSeconds: 30
+  $name: Auto-Dismiss Timeout (seconds)
+  $description: How long the Robot Buddy perches in the top-left before fading away (default 30 seconds).
 - openWindowMode: false
-  $name: Open LLM Window on Click (instead of Read & Reply on Notification)
+  $name: Open LLM Window on Click (Spotlight Bar Mode)
   $description: Off (default) = Read full summary/options on the HUD and reply inline without leaving your active window. On = Clicking the notification or an option opens and switches to the LLM window and chat.
 - keepOnPreviousSide: true
   $name: Keep Window & HUD on Previous Monitor / Side (Multi-Monitor)
@@ -48,19 +52,16 @@ An Apple-inspired **Liquid Glass floating HUD** positioned near the bottom taskb
   $description: Opacity of the frosted Apple Liquid Glass tint (lower = more translucent).
 - bottomOffsetPx: 64
   $name: Bottom Offset from Screen Edge (px)
-  $description: Distance above the bottom of the monitor (above the taskbar).
+  $description: Distance above the bottom of the monitor in Spotlight Bar Mode.
 - hudWidthPx: 540
   $name: HUD Width (px)
-  $description: Width of the Spotlight-style floating glass bar.
-- autoDismissSeconds: 18
-  $name: Auto-Dismiss Timeout (seconds)
-  $description: Set to 0 to keep the HUD visible until you click an option or swipe it away.
+  $description: Width of the Spotlight-style floating glass bar in Spotlight Bar Mode.
 - enableHotkeys: true
   $name: Enable Alt+1..4 Quick Option Hotkeys
   $description: Press Alt+1, Alt+2, Alt+3, or Alt+4 while the HUD is visible to answer without touching the mouse.
 - interceptToasts: true
   $name: Intercept LLM App Notifications & Taskbar Flashes
-  $description: Automatically trigger the Glass HUD when Antigravity, Cursor, VS Code, Claude, Codex, or Terminal fires a notification or flashes on cycle completion.
+  $description: Automatically trigger the HUD when Antigravity, Cursor, VS Code, Claude, Codex, or Terminal fires a notification or flashes on cycle completion.
 */
 // ==/WindhawkModSettings==
 
@@ -106,12 +107,13 @@ enum ACCENT_STATE {
 };
 
 struct ModSettings {
+    bool robotBuddyMode = true;
+    int autoDismissSeconds = 30;
     bool openWindowMode = false;
     bool keepOnPreviousSide = true;
     int glassOpacity = 176;
     int bottomOffsetPx = 64;
     int hudWidthPx = 540;
-    int autoDismissSeconds = 18;
     bool enableHotkeys = true;
     bool interceptToasts = true;
 } g_settings;
@@ -363,6 +365,7 @@ struct PointerSample {
 };
 
 static const int kPopoverCanvasReservePx = 152;
+static const int kBuddyCanvasSize = 184;
 
 struct HudChoreography {
     Spring1D ySpring;
@@ -373,6 +376,26 @@ struct HudChoreography {
     Spring1D pillScale[4];
     Spring1D pillHover[4];
     Spring1D pillEntrance[4];
+
+    // Futuristic Robot Buddy 120fps springs & flight state
+    Spring1D buddyXSpring;
+    Spring1D buddyYSpring;
+    Spring1D buddyScaleSpring;
+    Spring1D buddyOpacitySpring;
+    Spring1D buddyTiltSpring;
+    Spring1D buddyBlurSpring;
+    Spring1D buddyHoverSpring;
+    float buddyCenterX = 0.0f;
+    float buddyCenterY = 0.0f;
+    float buddyCornerX = 24.0f;
+    float buddyCornerY = 24.0f;
+    float buddyShakeX = 0.0f;
+    float buddyHopY = 0.0f;
+    bool buddyLaunchedToCorner = false;
+    bool buddyHovered = false;
+    bool hasCustomBuddyPerch = false;
+    float customBuddyPerchX = 24.0f;
+    float customBuddyPerchY = 24.0f;
 
     Spring1D popoverProgress;
     Spring1D popoverAnchorX;
@@ -920,11 +943,411 @@ static BYTE LerpByte(int a, int b, float t) {
     return static_cast<BYTE>(std::clamp(static_cast<int>(std::round(a + (b - a) * t)), 0, 255));
 }
 
+// Fast 2-pass separable Gaussian-approximation blur on 32-bit premultiplied ARGB DIB buffer
+static void ApplySeparableGaussianBlur(uint32_t* pixels, int w, int h, int radius) {
+    if (!pixels || radius <= 0 || w <= 0 || h <= 0) return;
+    radius = std::clamp(radius, 1, 14);
+    std::vector<uint32_t> temp(static_cast<size_t>(w * h));
+
+    // Pass 1..2: two-iteration separable box blur approximates a smooth Gaussian kernel
+    for (int iter = 0; iter < 2; ++iter) {
+        int r = (iter == 0) ? radius : std::max(1, (radius * 2) / 3);
+        int div = 2 * r + 1;
+
+        // Horizontal pass
+        for (int y = 0; y < h; ++y) {
+            const uint32_t* rowIn = pixels + y * w;
+            uint32_t* rowOut = temp.data() + y * w;
+            for (int x = 0; x < w; ++x) {
+                int sumB = 0, sumG = 0, sumR = 0, sumA = 0;
+                for (int k = -r; k <= r; ++k) {
+                    int sx = std::clamp(x + k, 0, w - 1);
+                    uint32_t px = rowIn[sx];
+                    sumB += (px & 0xFF);
+                    sumG += ((px >> 8) & 0xFF);
+                    sumR += ((px >> 16) & 0xFF);
+                    sumA += ((px >> 24) & 0xFF);
+                }
+                rowOut[x] = static_cast<uint32_t>((sumB / div) |
+                            ((sumG / div) << 8) |
+                            ((sumR / div) << 16) |
+                            ((sumA / div) << 24));
+            }
+        }
+
+        // Vertical pass
+        for (int y = 0; y < h; ++y) {
+            uint32_t* rowOut = pixels + y * w;
+            for (int x = 0; x < w; ++x) {
+                int sumB = 0, sumG = 0, sumR = 0, sumA = 0;
+                for (int k = -r; k <= r; ++k) {
+                    int sy = std::clamp(y + k, 0, h - 1);
+                    uint32_t px = temp[sy * w + x];
+                    sumB += (px & 0xFF);
+                    sumG += ((px >> 8) & 0xFF);
+                    sumR += ((px >> 16) & 0xFF);
+                    sumA += ((px >> 24) & 0xFF);
+                }
+                rowOut[x] = static_cast<uint32_t>((sumB / div) |
+                            ((sumG / div) << 8) |
+                            ((sumR / div) << 16) |
+                            ((sumA / div) << 24));
+            }
+        }
+    }
+}
+
+// Velocity-vector directional motion blur for high-speed flight from center screen to top-left
+static void ApplyDirectionalMotionBlur(uint32_t* pixels, int w, int h, float vx, float vy) {
+    float speed = std::sqrt(vx * vx + vy * vy);
+    if (!pixels || speed < 140.0f) return;
+
+    float ux = -vx / speed;
+    float uy = -vy / speed;
+    float maxStreakPx = std::clamp((speed - 140.0f) * 0.011f, 0.0f, 15.0f);
+    if (maxStreakPx < 1.2f) return;
+
+    const int kSamples = 7;
+    static const int kWeights[kSamples] = { 34, 24, 16, 11, 7, 5, 3 }; // sums to 100
+    std::vector<uint32_t> src(pixels, pixels + w * h);
+
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            int sumB = 0, sumG = 0, sumR = 0, sumA = 0;
+            for (int s = 0; s < kSamples; ++s) {
+                float t = static_cast<float>(s) / static_cast<float>(kSamples - 1);
+                int sx = std::clamp(static_cast<int>(std::round(x + ux * maxStreakPx * t)), 0, w - 1);
+                int sy = std::clamp(static_cast<int>(std::round(y + uy * maxStreakPx * t)), 0, h - 1);
+                uint32_t px = src[sy * w + sx];
+                int wgt = kWeights[s];
+                sumB += static_cast<int>(px & 0xFF) * wgt;
+                sumG += static_cast<int>((px >> 8) & 0xFF) * wgt;
+                sumR += static_cast<int>((px >> 16) & 0xFF) * wgt;
+                sumA += static_cast<int>((px >> 24) & 0xFF) * wgt;
+            }
+            pixels[y * w + x] = static_cast<uint32_t>((sumB / 100) |
+                                ((sumG / 100) << 8) |
+                                ((sumR / 100) << 16) |
+                                ((sumA / 100) << 24));
+        }
+    }
+}
+
+static void RenderRobotBuddyHud(HWND hwnd, const LLMCyclePayload& payload) {
+    const int size = kBuddyCanvasSize;
+    LONGLONG nowQpc = 0;
+    QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&nowQpc));
+    float elapsedSec = (g_anim.showQpc > 0 && g_anim.qpcFreq > 0)
+        ? static_cast<float>(nowQpc - g_anim.showQpc) / static_cast<float>(g_anim.qpcFreq)
+        : 0.0f;
+
+    float totalDuration = static_cast<float>(std::clamp(g_settings.autoDismissSeconds > 0 ? g_settings.autoDismissSeconds : 30, 5, 300));
+    float alphaScale = std::clamp(g_anim.buddyOpacitySpring.value, 0.0f, 1.0f);
+    float s = std::clamp(g_anim.buddyScaleSpring.value, 0.55f, 1.28f);
+    float hoverT = std::clamp(g_anim.buddyHoverSpring.value, 0.0f, 1.0f);
+
+    // Theme-adaptive neon palette per LLM agent
+    Color neonPrimary(255, 82, 232, 255);   // Electric Cyan default
+    Color neonSecondary(255, 120, 148, 255); // Indigo glow
+    if (StrStrIW(payload.sourceApp.c_str(), L"Claude")) {
+        neonPrimary = Color(255, 96, 238, 255);
+        neonSecondary = Color(255, 255, 152, 108); // Warm Claude coral-amber accent
+    } else if (StrStrIW(payload.sourceApp.c_str(), L"Codex")) {
+        neonPrimary = Color(255, 68, 248, 178);    // Cyber Emerald
+        neonSecondary = Color(255, 76, 210, 255);
+    }
+
+    HDC hdcScreen = GetDC(nullptr);
+    HDC hdcMem = CreateCompatibleDC(hdcScreen);
+
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = size;
+    bmi.bmiHeader.biHeight = -size;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void* pvBits = nullptr;
+    HBITMAP hbm = CreateDIBSection(hdcMem, &bmi, DIB_RGB_COLORS, &pvBits, nullptr, 0);
+    HBITMAP hbmOld = static_cast<HBITMAP>(SelectObject(hdcMem, hbm));
+
+    {
+        Graphics g(hdcMem);
+        g.SetSmoothingMode(SmoothingModeAntiAlias);
+        g.SetPixelOffsetMode(PixelOffsetModeHighQuality);
+        g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+
+        auto A = [alphaScale](int a) -> BYTE {
+            return static_cast<BYTE>(std::clamp(static_cast<int>(std::round(a * alphaScale)), 0, 255));
+        };
+
+        float cx = size * 0.5f + g_anim.buddyShakeX;
+        float cy = size * 0.5f - 6.0f + g_anim.buddyHopY;
+
+        // Zero-gravity hover breathing once perched in the top-left
+        if (elapsedSec > 1.25f && !g_anim.isDragging) {
+            cy += std::sin((elapsedSec - 1.25f) * 2.7f) * 2.8f;
+        }
+
+        g.TranslateTransform(cx, cy);
+        g.ScaleTransform(s, s);
+
+        // 1. Soft multi-ring ambient bloom aura behind the Robot Buddy
+        for (int ring = 4; ring >= 1; --ring) {
+            float r = 38.0f + ring * 8.5f + hoverT * 4.0f;
+            int ringAlpha = (5 - ring) * (hoverT > 0.1f ? 13 : 9);
+            SolidBrush auraBrush(Color(A(ringAlpha), neonPrimary.GetR(), neonPrimary.GetG(), neonPrimary.GetB()));
+            g.FillEllipse(&auraBrush, -r, -r, r * 2.0f, r * 2.0f);
+        }
+
+        // Expanding sonar pulse ring during the center-screen pop-in greeting (0.05s .. 0.95s)
+        if (elapsedSec > 0.04f && elapsedSec < 0.98f) {
+            float pulseT = std::clamp((elapsedSec - 0.04f) / 0.88f, 0.0f, 1.0f);
+            float pulseEase = 1.0f - std::pow(1.0f - pulseT, 3.0f);
+            float pulseR = 34.0f + pulseEase * 44.0f;
+            BYTE pulseAlpha = A(static_cast<int>((1.0f - pulseT) * 165.0f));
+            Pen sonarPen(Color(pulseAlpha, neonPrimary.GetR(), neonPrimary.GetG(), neonPrimary.GetB()), 2.2f * (1.0f - pulseT * 0.5f));
+            g.DrawEllipse(&sonarPen, -pulseR, -pulseR, pulseR * 2.0f, pulseR * 2.0f);
+        }
+
+        // 2. Frosted Liquid Glass Orbital Backing Disc + 30s Countdown Halo Ring
+        float discR = 44.0f;
+        LinearGradientBrush discFill(
+            PointF(0.0f, -discR),
+            PointF(0.0f, discR),
+            Color(A(188), 54, 62, 84),
+            Color(A(212), 28, 34, 50)
+        );
+        g.FillEllipse(&discFill, -discR, -discR, discR * 2.0f, discR * 2.0f);
+
+        // Inner top frost sheen on the glass disc
+        LinearGradientBrush discSheen(
+            PointF(0.0f, -discR),
+            PointF(0.0f, 4.0f),
+            Color(A(62), 240, 248, 255),
+            Color(A(0), 240, 248, 255)
+        );
+        g.FillEllipse(&discSheen, -(discR - 1.5f), -(discR - 1.5f), (discR - 1.5f) * 2.0f, (discR - 1.5f) * 1.4f);
+
+        // Subtle track ring + 30-second countdown progress arc around the perimeter
+        Pen trackPen(Color(A(68), 220, 235, 255), 2.2f);
+        g.DrawEllipse(&trackPen, -discR, -discR, discR * 2.0f, discR * 2.0f);
+
+        float remainFrac = 1.0f;
+        if (elapsedSec > 1.05f) {
+            remainFrac = std::clamp(1.0f - (elapsedSec - 1.05f) / totalDuration, 0.0f, 1.0f);
+        }
+        Color arcColor = (remainFrac < 0.18f)
+            ? Color(A(235), 255, 168, 84)
+            : Color(A(225), neonPrimary.GetR(), neonPrimary.GetG(), neonPrimary.GetB());
+        Pen countdownPen(arcColor, 2.6f);
+        countdownPen.SetStartCap(LineCapRound);
+        countdownPen.SetEndCap(LineCapRound);
+        g.DrawArc(&countdownPen, -discR, -discR, discR * 2.0f, discR * 2.0f, -90.0f, remainFrac * 360.0f);
+
+        // 3. Rotate the Robot Buddy Head & Chassis by the dynamic tilt/shake/bank angle
+        GraphicsState headState = g.Save();
+        float tiltDeg = g_anim.buddyTiltSpring.value;
+        g.RotateTransform(tiltDeg);
+
+        // Floating Telemetry Antenna at top of head (with secondary spring overlap)
+        float antennaLagDeg = std::clamp(tiltDeg * 0.35f, -12.0f, 12.0f);
+        float antTopY = -36.5f - (elapsedSec < 0.9f ? 3.0f * std::sin(elapsedSec * 14.0f) : 0.0f);
+        Pen antStemPen(Color(A(220), 210, 226, 250), 2.4f);
+        antStemPen.SetStartCap(LineCapRound);
+        g.DrawLine(&antStemPen, PointF(0.0f, -24.0f), PointF(antennaLagDeg * 0.35f, antTopY));
+
+        float orbX = antennaLagDeg * 0.35f;
+        SolidBrush antGlowBrush(Color(A(115), neonSecondary.GetR(), neonSecondary.GetG(), neonSecondary.GetB()));
+        g.FillEllipse(&antGlowBrush, orbX - 7.5f, antTopY - 7.5f, 15.0f, 15.0f);
+        SolidBrush antCoreBrush(Color(A(255), 255, 250, 255));
+        g.FillEllipse(&antCoreBrush, orbX - 3.6f, antTopY - 3.6f, 7.2f, 7.2f);
+
+        // Side Acoustic Ear-Pods (shift slightly with head tilt parallax)
+        float earShiftY = tiltDeg * 0.08f;
+        RectF leftEar(-35.5f, -9.0f - earShiftY, 7.5f, 18.0f);
+        RectF rightEar(28.0f, -9.0f + earShiftY, 7.5f, 18.0f);
+        GraphicsPath earsPath;
+        AddRoundRect(earsPath, leftEar, 3.6f);
+        AddRoundRect(earsPath, rightEar, 3.6f);
+        SolidBrush earBrush(Color(A(235), 185, 202, 232));
+        Pen earRimPen(Color(A(180), 255, 255, 255), 1.0f);
+        g.FillPath(&earBrush, &earsPath);
+        g.DrawPath(&earRimPen, &earsPath);
+
+        // Outer Futuristic Robot Head Shell (Pearlescent Titanium + Liquid Glass Squircle)
+        RectF headRect(-30.0f, -24.0f, 60.0f, 48.0f);
+        GraphicsPath headPath;
+        AddRoundRect(headPath, headRect, 20.0f);
+
+        LinearGradientBrush headBodyBrush(
+            PointF(0.0f, -24.0f),
+            PointF(0.0f, 24.0f),
+            Color(A(252), 248, 251, 255),
+            Color(A(246), 192, 208, 236)
+        );
+        g.FillPath(&headBodyBrush, &headPath);
+
+        // Crisp icy specular rim around the robot head
+        Pen headRimPen(Color(A(250), 255, 255, 255), 1.6f);
+        g.DrawPath(&headRimPen, &headPath);
+
+        // Recessed Deep-Space Obsidian Glass Visor
+        RectF visorRect(-23.5f, -15.5f, 47.0f, 30.0f);
+        GraphicsPath visorPath;
+        AddRoundRect(visorPath, visorRect, 13.5f);
+        LinearGradientBrush visorBrush(
+            PointF(0.0f, -15.5f),
+            PointF(0.0f, 14.5f),
+            Color(A(252), 16, 22, 38),
+            Color(A(254), 26, 36, 62)
+        );
+        Pen visorRimPen(Color(A(140), 120, 175, 245), 1.15f);
+        g.FillPath(&visorBrush, &visorPath);
+        g.DrawPath(&visorRimPen, &visorPath);
+
+        // Subtle diagonal glass reflection across the top-left of the visor
+        GraphicsPath visorGlint;
+        AddRoundRect(visorGlint, RectF(-20.0f, -13.0f, 26.0f, 7.5f), 3.7f);
+        LinearGradientBrush glintBrush(
+            PointF(-20.0f, -13.0f),
+            PointF(6.0f, -5.5f),
+            Color(A(58), 255, 255, 255),
+            Color(A(0), 255, 255, 255)
+        );
+        g.FillPath(&glintBrush, &visorGlint);
+
+        // 4. Expressive Glowing Robot Eyes inside the Visor
+        // Happy excited arc eyes (^  ^) during the center pop-in shake or when hovered!
+        bool happySquint = (elapsedSec >= 0.14f && elapsedSec <= 0.86f) || (hoverT > 0.35f);
+
+        // Eye pupil tracking toward the mouse cursor when perched
+        POINT cursorPt = {};
+        GetCursorPos(&cursorPt);
+        RECT wndRc = {};
+        GetWindowRect(hwnd, &wndRc);
+        float wndCenterX = (wndRc.left + wndRc.right) * 0.5f;
+        float wndCenterY = (wndRc.top + wndRc.bottom) * 0.5f;
+        float lookX = std::clamp((cursorPt.x - wndCenterX) * 0.012f, -3.4f, 3.4f);
+        float lookY = std::clamp((cursorPt.y - wndCenterY) * 0.010f, -2.0f, 2.0f);
+
+        // Natural periodic blink every ~4.1s
+        float blinkCycle = std::fmod(elapsedSec + 1.8f, 4.1f);
+        float eyeOpenScale = 1.0f;
+        if (blinkCycle > 3.92f) {
+            float bt = (blinkCycle - 3.92f) / 0.18f;
+            eyeOpenScale = std::max(0.12f, std::fabs(std::cos(bt * 3.14159265f)));
+        }
+
+        SolidBrush eyeGlowBrush(Color(A(95), neonPrimary.GetR(), neonPrimary.GetG(), neonPrimary.GetB()));
+        SolidBrush eyeCoreBrush(Color(A(255), 215, 252, 255));
+        Pen happyArcPen(Color(A(255), 205, 252, 255), 3.1f);
+        happyArcPen.SetStartCap(LineCapRound);
+        happyArcPen.SetEndCap(LineCapRound);
+        Pen happyGlowPen(Color(A(105), neonPrimary.GetR(), neonPrimary.GetG(), neonPrimary.GetB()), 6.2f);
+        happyGlowPen.SetStartCap(LineCapRound);
+        happyGlowPen.SetEndCap(LineCapRound);
+
+        float leftEyeX = -10.5f + lookX;
+        float rightEyeX = 10.5f + lookX;
+        float eyeY = -1.0f + lookY;
+
+        if (happySquint) {
+            // Excited happy robot eye arcs (^   ^)
+            g.DrawArc(&happyGlowPen, leftEyeX - 6.0f, eyeY - 5.0f, 12.0f, 11.0f, 195.0f, 150.0f);
+            g.DrawArc(&happyGlowPen, rightEyeX - 6.0f, eyeY - 5.0f, 12.0f, 11.0f, 195.0f, 150.0f);
+            g.DrawArc(&happyArcPen, leftEyeX - 6.0f, eyeY - 5.0f, 12.0f, 11.0f, 195.0f, 150.0f);
+            g.DrawArc(&happyArcPen, rightEyeX - 6.0f, eyeY - 5.0f, 12.0f, 11.0f, 195.0f, 150.0f);
+        } else {
+            float eyeW = 7.6f;
+            float eyeH = std::max(2.0f, 11.4f * eyeOpenScale);
+            RectF lGlow(leftEyeX - eyeW * 0.5f - 2.5f, eyeY - eyeH * 0.5f - 2.5f, eyeW + 5.0f, eyeH + 5.0f);
+            RectF rGlow(rightEyeX - eyeW * 0.5f - 2.5f, eyeY - eyeH * 0.5f - 2.5f, eyeW + 5.0f, eyeH + 5.0f);
+            g.FillEllipse(&eyeGlowBrush, lGlow);
+            g.FillEllipse(&eyeGlowBrush, rGlow);
+
+            GraphicsPath eyesPath;
+            AddRoundRect(eyesPath, RectF(leftEyeX - eyeW * 0.5f, eyeY - eyeH * 0.5f, eyeW, eyeH), eyeW * 0.48f);
+            AddRoundRect(eyesPath, RectF(rightEyeX - eyeW * 0.5f, eyeY - eyeH * 0.5f, eyeW, eyeH), eyeW * 0.48f);
+            g.FillPath(&eyeCoreBrush, &eyesPath);
+        }
+
+        g.Restore(headState);
+
+        // 5. Sleek Floating Micro-Title Pill below the Robot Buddy (tilts gently at 40% of head tilt)
+        GraphicsState pillState = g.Save();
+        g.RotateTransform(tiltDeg * 0.38f);
+
+        FontFamily fontFamily(L"Segoe UI Variable Display");
+        FontFamily fallbackFamily(L"Segoe UI");
+        const FontFamily* fam = fontFamily.IsAvailable() ? &fontFamily : &fallbackFamily;
+        Font labelFont(fam, 10.5f, FontStyleBold, UnitPixel);
+
+        std::wstring badgeLabel = (hoverT > 0.35f)
+            ? (L"Open " + payload.sourceApp + L" \x2192")
+            : (payload.sourceApp + L" \x00B7 Ready");
+        if (badgeLabel.size() > 18) {
+            badgeLabel = badgeLabel.substr(0, 17) + L"\x2026";
+        }
+
+        RectF labelPillRect(-56.0f, 34.0f, 112.0f, 20.0f);
+        GraphicsPath labelPillPath;
+        AddRoundRect(labelPillPath, labelPillRect, 10.0f);
+        SolidBrush labelFill(Color(A(210), 30, 38, 58));
+        Pen labelPen(Color(A(165), neonPrimary.GetR(), neonPrimary.GetG(), neonPrimary.GetB()), 1.1f);
+        g.FillPath(&labelFill, &labelPillPath);
+        g.DrawPath(&labelPen, &labelPillPath);
+
+        StringFormat centerFmt;
+        centerFmt.SetAlignment(StringAlignmentCenter);
+        centerFmt.SetLineAlignment(StringAlignmentCenter);
+        centerFmt.SetFormatFlags(StringFormatFlagsNoWrap);
+        SolidBrush labelTextBrush(Color(A(252), 245, 250, 255));
+        g.DrawString(badgeLabel.c_str(), -1, &labelFont, labelPillRect, &centerFmt, &labelTextBrush);
+
+        g.Restore(pillState);
+    }
+
+    // Apply real pixel-level Directional Motion Blur (during flight) and Optical Gaussian Blur (on entrance/exit)
+    uint32_t* rawPixels = static_cast<uint32_t*>(pvBits);
+    if (rawPixels) {
+        ApplyDirectionalMotionBlur(rawPixels, size, size, g_anim.buddyXSpring.velocity, g_anim.buddyYSpring.velocity);
+        int dofRadius = static_cast<int>(std::round(g_anim.buddyBlurSpring.value));
+        if (dofRadius >= 1) {
+            ApplySeparableGaussianBlur(rawPixels, size, size, dofRadius);
+        }
+    }
+
+    int screenX = static_cast<int>(std::round(g_anim.buddyXSpring.value));
+    int screenY = static_cast<int>(std::round(g_anim.buddyYSpring.value));
+
+    POINT ptSrc = {0, 0};
+    POINT ptDst = {screenX, screenY};
+    SIZE wndSize = {size, size};
+    BLENDFUNCTION blend = {};
+    blend.BlendOp = AC_SRC_OVER;
+    blend.SourceConstantAlpha = 255;
+    blend.AlphaFormat = AC_SRC_ALPHA;
+
+    UpdateLayeredWindow(hwnd, hdcScreen, &ptDst, &wndSize, hdcMem, &ptSrc, 0, &blend, ULW_ALPHA);
+
+    SelectObject(hdcMem, hbmOld);
+    DeleteObject(hbm);
+    DeleteDC(hdcMem);
+    ReleaseDC(nullptr, hdcScreen);
+}
+
 static void RenderGlassHud(HWND hwnd) {
     LLMCyclePayload payload;
     {
         std::lock_guard<std::mutex> lock(g_payloadMutex);
         payload = g_currentPayload;
+    }
+
+    if (g_settings.robotBuddyMode) {
+        RenderRobotBuddyHud(hwnd, payload);
+        return;
     }
 
     int width = std::clamp(g_settings.hudWidthPx, 360, 960);
@@ -1363,6 +1786,15 @@ static void StartDismissAnimation(HWND hwnd, float releaseVelocityY = 0.0f) {
     g_anim.yZeta = 1.0f;
     g_anim.popoverActive = false;
     g_anim.popoverProgress.target = 0.0f;
+
+    if (g_settings.robotBuddyMode) {
+        g_anim.buddyOpacitySpring.target = 0.0f;
+        g_anim.buddyScaleSpring.target = IsReducedMotionEnabled() ? 0.96f : 0.86f;
+        g_anim.buddyBlurSpring.target = IsReducedMotionEnabled() ? 0.0f : 8.5f;
+        EnsureAnimationLoopRunning(hwnd);
+        return;
+    }
+
     if (IsReducedMotionEnabled()) {
         g_anim.ySpring.target = 0.0f;
         g_anim.scaleSpring.target = 1.0f;
@@ -1384,6 +1816,86 @@ static void StepSpringAnimation(HWND hwnd) {
     float dt = static_cast<float>(now - g_anim.lastFrameQpc) / static_cast<float>(g_anim.qpcFreq);
     g_anim.lastFrameQpc = now;
     dt = std::clamp(dt, 0.001f, 0.033f);
+
+    if (g_settings.robotBuddyMode) {
+        float elapsedSec = (g_anim.showQpc > 0 && g_anim.qpcFreq > 0)
+            ? static_cast<float>(now - g_anim.showQpc) / static_cast<float>(g_anim.qpcFreq)
+            : 0.0f;
+        bool reduced = IsReducedMotionEnabled();
+
+        if (!g_anim.dismissing) {
+            if (!g_anim.buddyLaunchedToCorner) {
+                // Phase 1 (0.0s .. 1.05s): Center-Screen Pop-In + Futuristic Robot Head Tilt & Excited Shake
+                if (!reduced && elapsedSec >= 0.06f && elapsedSec < 0.92f) {
+                    float tNorm = std::clamp((elapsedSec - 0.06f) / 0.86f, 0.0f, 1.0f);
+                    float env = std::sin(tNorm * 3.14159265f);
+                    g_anim.buddyTiltSpring.target = env * 21.0f * std::sin((elapsedSec - 0.06f) * 25.0f);
+                    g_anim.buddyShakeX = env * 6.5f * std::cos((elapsedSec - 0.06f) * 25.0f);
+                    g_anim.buddyHopY = -env * 9.5f * std::fabs(std::sin((elapsedSec - 0.06f) * 12.5f));
+                } else {
+                    g_anim.buddyTiltSpring.target = 0.0f;
+                    g_anim.buddyShakeX = 0.0f;
+                    g_anim.buddyHopY = 0.0f;
+                }
+
+                // Settle scale after initial pop overshoot
+                if (elapsedSec > 0.18f) {
+                    g_anim.buddyScaleSpring.target = 1.0f;
+                }
+
+                // Phase 2 (t >= 1.05s): Launch smoothly from Center Screen to Top-Left Corner
+                if (elapsedSec >= (reduced ? 0.45f : 1.05f)) {
+                    g_anim.buddyLaunchedToCorner = true;
+                    g_anim.buddyXSpring.target = g_anim.buddyCornerX;
+                    g_anim.buddyYSpring.target = g_anim.buddyCornerY;
+                    if (!reduced) {
+                        // Swooping upward-left arc impulse
+                        g_anim.buddyYSpring.velocity -= 290.0f;
+                        g_anim.buddyXSpring.velocity -= 160.0f;
+                    }
+                    g_anim.buddyScaleSpring.target = 0.88f;
+                    g_anim.buddyShakeX = 0.0f;
+                    g_anim.buddyHopY = 0.0f;
+                }
+            } else {
+                // In-flight aerodynamic bank tilt + top-left perch idle attitude
+                float vx = g_anim.buddyXSpring.velocity;
+                float vy = g_anim.buddyYSpring.velocity;
+                float speed = std::sqrt(vx * vx + vy * vy);
+                if (speed > 60.0f && !reduced) {
+                    g_anim.buddyTiltSpring.target = std::clamp(vx * 0.016f, -22.0f, 22.0f);
+                } else {
+                    float idleTilt = (!reduced && elapsedSec > 1.8f)
+                        ? std::sin((elapsedSec - 1.8f) * 1.5f) * 2.4f
+                        : 0.0f;
+                    g_anim.buddyTiltSpring.target = g_anim.buddyHovered ? 8.5f : idleTilt;
+                }
+                g_anim.buddyScaleSpring.target = g_anim.buddyHovered ? 0.98f : 0.88f;
+            }
+        }
+
+        if (!g_anim.isDragging) {
+            g_anim.buddyXSpring.Step(dt, 9.8f, 0.88f);
+            g_anim.buddyYSpring.Step(dt, 9.8f, 0.88f);
+        }
+        g_anim.buddyScaleSpring.Step(dt, 30.0f, 0.72f);
+        bool opMoving = g_anim.buddyOpacitySpring.Step(dt, 24.0f, 1.0f);
+        g_anim.buddyTiltSpring.Step(dt, 38.0f, 0.76f);
+        g_anim.buddyBlurSpring.Step(dt, 26.0f, 1.0f);
+        g_anim.buddyHoverSpring.Step(dt, 30.0f, 1.0f);
+
+        RenderGlassHud(hwnd);
+
+        // Keep animation loop alive while visible in Robot Buddy mode (for 30s countdown ring, eye tracking & hover bob)
+        if (g_anim.dismissing && !opMoving && g_anim.buddyOpacitySpring.value <= 0.01f) {
+            KillTimer(hwnd, TIMER_SPRING_FRAME);
+            g_anim.lastFrameQpc = 0;
+            g_anim.visible = false;
+            g_anim.dismissing = false;
+            ShowWindow(hwnd, SW_HIDE);
+        }
+        return;
+    }
 
     bool anyMoving = false;
 
@@ -1429,12 +1941,60 @@ static LRESULT CALLBACK GlassHudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
     switch (msg) {
         case WM_APP_SHOW_LLM_HUD: {
             float targetH = 132.0f;
+            HWND payloadTargetWnd = nullptr;
             {
                 std::lock_guard<std::mutex> lock(g_payloadMutex);
                 targetH = static_cast<float>(ComputeTargetHudHeight(g_currentPayload));
+                payloadTargetWnd = g_currentPayload.targetWindow;
             }
 
             bool reduced = IsReducedMotionEnabled();
+
+            // Determine active monitor bounds for Center Pop-In -> Top-Left Perch
+            RECT monRc = { 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN) };
+            HMONITOR hMon = nullptr;
+            if (g_settings.keepOnPreviousSide && payloadTargetWnd && IsWindow(payloadTargetWnd)) {
+                hMon = MonitorFromWindow(payloadTargetWnd, MONITOR_DEFAULTTONEAREST);
+                g_anim.customMonitor = hMon;
+            } else if (g_settings.keepOnPreviousSide && g_anim.customMonitor) {
+                hMon = g_anim.customMonitor;
+            } else {
+                POINT cursorPt = {};
+                GetCursorPos(&cursorPt);
+                hMon = MonitorFromPoint(cursorPt, MONITOR_DEFAULTTONEAREST);
+            }
+            if (hMon) {
+                MONITORINFO mi = {};
+                mi.cbSize = sizeof(mi);
+                if (GetMonitorInfoW(hMon, &mi)) {
+                    monRc = mi.rcWork;
+                }
+            }
+
+            float monW = static_cast<float>(monRc.right - monRc.left);
+            float monH = static_cast<float>(monRc.bottom - monRc.top);
+            g_anim.buddyCenterX = static_cast<float>(monRc.left) + (monW - kBuddyCanvasSize) * 0.5f;
+            g_anim.buddyCenterY = static_cast<float>(monRc.top) + (monH - kBuddyCanvasSize) * 0.44f;
+            if (g_anim.hasCustomBuddyPerch) {
+                g_anim.buddyCornerX = g_anim.customBuddyPerchX;
+                g_anim.buddyCornerY = g_anim.customBuddyPerchY;
+            } else {
+                g_anim.buddyCornerX = static_cast<float>(monRc.left) + 20.0f;
+                g_anim.buddyCornerY = static_cast<float>(monRc.top) + 20.0f;
+            }
+
+            g_anim.buddyXSpring.Reset(g_anim.buddyCenterX, g_anim.buddyCenterX, 0.0f);
+            g_anim.buddyYSpring.Reset(g_anim.buddyCenterY, g_anim.buddyCenterY, 0.0f);
+            g_anim.buddyScaleSpring.Reset(reduced ? 1.0f : 0.82f, reduced ? 1.0f : 1.08f, reduced ? 0.0f : 4.2f);
+            g_anim.buddyOpacitySpring.Reset(0.0f, 1.0f, 0.0f);
+            g_anim.buddyBlurSpring.Reset(reduced ? 0.0f : 8.5f, 0.0f, 0.0f);
+            g_anim.buddyTiltSpring.Reset(reduced ? 0.0f : -16.0f, 0.0f, 0.0f);
+            g_anim.buddyHoverSpring.Reset(0.0f, 0.0f, 0.0f);
+            g_anim.buddyShakeX = 0.0f;
+            g_anim.buddyHopY = 0.0f;
+            g_anim.buddyLaunchedToCorner = false;
+            g_anim.buddyHovered = false;
+
             if (!g_anim.visible) {
                 g_anim.ySpring.Reset(reduced ? 0.0f : 56.0f, 0.0f, 0.0f);
                 g_anim.scaleSpring.Reset(reduced ? 1.0f : 0.96f, 1.0f, 0.0f);
@@ -1472,7 +2032,7 @@ static LRESULT CALLBACK GlassHudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             ApplyAppleGlassBackdrop(hwnd);
 
-            if (g_settings.enableHotkeys) {
+            if (g_settings.enableHotkeys && !g_settings.robotBuddyMode) {
                 for (int k = 1; k <= 4; ++k) {
                     RegisterHotKey(hwnd, 2000 + k, MOD_ALT | MOD_NOREPEAT, '0' + k);
                 }
@@ -1480,8 +2040,14 @@ static LRESULT CALLBACK GlassHudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 
             g_anim.lastFrameQpc = 0;
             EnsureAnimationLoopRunning(hwnd);
-            if (g_settings.autoDismissSeconds > 0) {
-                SetTimer(hwnd, TIMER_AUTO_DISMISS, std::clamp(g_settings.autoDismissSeconds, 3, 300) * 1000, nullptr);
+            int dismissSec = g_settings.autoDismissSeconds;
+            if (g_settings.robotBuddyMode && dismissSec <= 0) {
+                dismissSec = 30;
+            }
+            if (dismissSec > 0) {
+                UINT timeoutMs = static_cast<UINT>(std::clamp(dismissSec, 3, 300) * 1000) +
+                                 (g_settings.robotBuddyMode ? 1100u : 0u);
+                SetTimer(hwnd, TIMER_AUTO_DISMISS, timeoutMs, nullptr);
             }
             return 0;
         }
@@ -1522,6 +2088,18 @@ static LRESULT CALLBACK GlassHudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             if (g_anim.isDragging || g_anim.IsWithinClickjackGraceWindow()) return 0;
             int x = GET_X_LPARAM(lParam);
             int y = GET_Y_LPARAM(lParam);
+
+            if (g_settings.robotBuddyMode) {
+                SetCapture(hwnd);
+                g_anim.isDragging = true;
+                GetCursorPos(&g_anim.dragStartScreenPt);
+                g_anim.dragStartOffsetX = g_anim.buddyXSpring.value;
+                g_anim.dragStartOffsetY = g_anim.buddyYSpring.value;
+                g_anim.buddyScaleSpring.target = 0.80f;
+                EnsureAnimationLoopRunning(hwnd);
+                return 0;
+            }
+
             if (y < kPopoverCanvasReservePx) return 0;
 
             int optIdx = HitTestOption(x, y);
@@ -1563,6 +2141,32 @@ static LRESULT CALLBACK GlassHudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         case WM_MOUSEMOVE: {
             int x = GET_X_LPARAM(lParam);
             int y = GET_Y_LPARAM(lParam);
+
+            if (g_settings.robotBuddyMode) {
+                if (g_anim.isDragging) {
+                    POINT pt;
+                    GetCursorPos(&pt);
+                    float deltaX = static_cast<float>(pt.x - g_anim.dragStartScreenPt.x);
+                    float deltaY = static_cast<float>(pt.y - g_anim.dragStartScreenPt.y);
+                    if (std::fabs(deltaX) >= 6.0f || std::fabs(deltaY) >= 6.0f) {
+                        g_anim.buddyLaunchedToCorner = true;
+                        g_anim.buddyXSpring.value = g_anim.dragStartOffsetX + deltaX;
+                        g_anim.buddyYSpring.value = g_anim.dragStartOffsetY + deltaY;
+                        g_anim.buddyXSpring.target = g_anim.buddyXSpring.value;
+                        g_anim.buddyYSpring.target = g_anim.buddyYSpring.value;
+                    }
+                    RenderGlassHud(hwnd);
+                    return 0;
+                }
+                if (!g_anim.buddyHovered) {
+                    g_anim.buddyHovered = true;
+                    g_anim.buddyHoverSpring.target = 1.0f;
+                    EnsureAnimationLoopRunning(hwnd);
+                }
+                TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, hwnd, 0};
+                TrackMouseEvent(&tme);
+                return 0;
+            }
 
             if (g_anim.isDragging) {
                 POINT pt;
@@ -1637,6 +2241,14 @@ static LRESULT CALLBACK GlassHudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         }
 
         case WM_MOUSELEAVE: {
+            if (g_settings.robotBuddyMode) {
+                if (g_anim.buddyHovered) {
+                    g_anim.buddyHovered = false;
+                    g_anim.buddyHoverSpring.target = 0.0f;
+                    EnsureAnimationLoopRunning(hwnd);
+                }
+                return 0;
+            }
             if (g_anim.hoveredOption != -1 || g_anim.pressedOption != -1 ||
                 g_anim.hoveredSummary || g_anim.popoverActive) {
                 g_anim.hoveredOption = -1;
@@ -1656,6 +2268,33 @@ static LRESULT CALLBACK GlassHudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         case WM_LBUTTONUP: {
             int x = GET_X_LPARAM(lParam);
             int y = GET_Y_LPARAM(lParam);
+
+            if (g_settings.robotBuddyMode) {
+                if (g_anim.isDragging) {
+                    ReleaseCapture();
+                    g_anim.isDragging = false;
+                    POINT pt;
+                    GetCursorPos(&pt);
+                    float totalDeltaX = static_cast<float>(pt.x - g_anim.dragStartScreenPt.x);
+                    float totalDeltaY = static_cast<float>(pt.y - g_anim.dragStartScreenPt.y);
+                    if (std::fabs(totalDeltaX) < 8.0f && std::fabs(totalDeltaY) < 8.0f) {
+                        // Clicked the Robot Buddy before timer ran out -> bring the finished LLM to the top!
+                        g_anim.buddyScaleSpring.velocity = 5.5f;
+                        SendAnswerToLLM(L"", true);
+                        StartDismissAnimation(hwnd);
+                    } else {
+                        // Dragged Robot Buddy to a custom perch spot
+                        g_anim.hasCustomBuddyPerch = true;
+                        g_anim.customBuddyPerchX = g_anim.buddyXSpring.value;
+                        g_anim.customBuddyPerchY = g_anim.buddyYSpring.value;
+                        g_anim.buddyCornerX = g_anim.customBuddyPerchX;
+                        g_anim.buddyCornerY = g_anim.customBuddyPerchY;
+                        g_anim.buddyScaleSpring.target = 0.88f;
+                        EnsureAnimationLoopRunning(hwnd);
+                    }
+                }
+                return 0;
+            }
 
             if (g_anim.pressedOption >= 0) {
                 int releasedIdx = HitTestOption(x, y);
@@ -1728,6 +2367,10 @@ static LRESULT CALLBACK GlassHudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         }
 
         case WM_RBUTTONUP: {
+            if (g_settings.robotBuddyMode) {
+                StartDismissAnimation(hwnd);
+                return 0;
+            }
             int x = GET_X_LPARAM(lParam);
             int y = GET_Y_LPARAM(lParam);
             int optIdx = HitTestOption(x, y);
@@ -2003,12 +2646,13 @@ BOOL WINAPI Hooked_FlashWindowEx(PFLASHWINFO pfwi) {
 }
 
 static void LoadSettings() {
-    g_settings.glassOpacity = Wh_GetIntSetting(L"glassOpacity");
-    g_settings.bottomOffsetPx = Wh_GetIntSetting(L"bottomOffsetPx");
-    g_settings.hudWidthPx = Wh_GetIntSetting(L"hudWidthPx");
+    g_settings.robotBuddyMode = Wh_GetIntSetting(L"robotBuddyMode") != 0;
     g_settings.autoDismissSeconds = Wh_GetIntSetting(L"autoDismissSeconds");
     g_settings.openWindowMode = Wh_GetIntSetting(L"openWindowMode") != 0;
     g_settings.keepOnPreviousSide = Wh_GetIntSetting(L"keepOnPreviousSide") != 0;
+    g_settings.glassOpacity = Wh_GetIntSetting(L"glassOpacity");
+    g_settings.bottomOffsetPx = Wh_GetIntSetting(L"bottomOffsetPx");
+    g_settings.hudWidthPx = Wh_GetIntSetting(L"hudWidthPx");
     g_settings.enableHotkeys = Wh_GetIntSetting(L"enableHotkeys") != 0;
     g_settings.interceptToasts = Wh_GetIntSetting(L"interceptToasts") != 0;
 }
