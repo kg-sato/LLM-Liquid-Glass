@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              llm-liquid-glass-hud
-// @name            LLM Liquid Glass HUD (Anime Cat Buddy & Spotlight Bar)
-// @description     Cute Anime Cat Buddies (Orange Cat for Claude, Black Cat for Codex, Green Cat for Gemini) that pop up in the very middle of your screen, hover playfully for 2 seconds, then smoothly glide to the top-left corner for 30s. Clicking brings the LLM to the top.
-// @version         1.8.0
+// @name            LLM Liquid Glass HUD (Mac Island & Dock Integration + Anime Cat Buddies)
+// @description     Cute Anime Cat Buddies (Orange Cat for Claude, Black Cat for Codex, Green Cat for Gemini) seamlessly integrated into caliberda's Mac Island & Dock top bar. When an LLM finishes a turn, the alert drops smoothly out of the Dynamic Island bar. Also supports standalone Robot Buddy & Spotlight bar.
+// @version         1.9.0
 // @author          kg-sato
 // @github          https://github.com/kg-sato/LLM-Liquid-Glass
 // @include         explorer.exe
@@ -24,27 +24,33 @@
 An Apple-inspired **Anime Cat Buddy & Liquid Glass HUD** that surfaces when an LLM or coding agent finishes a cycle.
 
 ## Key Features
+- **Mac Island & Dock Integration (caliberda v3.0.0+)**:
+  - Seamlessly integrates with the top **Mac Island & Dock** Dynamic Island bar (`WindhawkMacIslandDockIsland`).
+  - When an LLM finishes its turn, the alert emerges directly from the top Island bar in an Apple fluid spring drop-down motion.
+  - Features the high-res transparent Anime Cat, LLM badge, turn summary/choices, and a 30s countdown ring.
+  - Multi-monitor aware: attaches to the Mac Island on whichever monitor the LLM was active on!
+  - Clicking focuses and activates the finished LLM window.
 - **3 Unique Anime Cat Popups (One per LLM)**:
   - **Claude (Orange)**: Adorable orange kitten nestled in an orange peel with little leaf and tail (`cat_claude_orange.png`).
   - **Codex (Black)**: Charming fluffy black kitten with big eyes, red bow collar, and white ruff (`cat_codex_black.png`).
   - **Gemini / Antigravity (Green)**: Cute lime-green cat with a lychee hairclip and fresh limes (`cat_gemini_green.png`).
-- **Very Middle 2-Second Hover & Top-Left Glide**:
-  - Pops up directly in the **very middle** of your active screen/monitor.
-  - Hovers playfully with gentle head-tilt and breathing bounce for **2.0 seconds**.
-  - Smoothly glides to the **top-left corner** in a zero-gravity hover drift with directional motion blur and optical depth-of-field focus.
-  - Perches in the top-left for **30 seconds** with an orbital countdown halo ring before softly blurring and fading away.
-  - **Click to Focus**: Clicking the cat at any point brings the finished LLM window and exact chat session to the top!
+- **Standalone Modes**:
+  - Robot Buddy floating pop-in & top-left perch when Mac Island is not running.
+  - Bottom Apple Liquid Glass Spotlight bar.
 */
 // ==/WindhawkModReadme==
 
 // ==WindhawkModSettings==
 /*
+- macIslandIntegration: true
+  $name: Integrate with Mac Island & Dock
+  $description: On (default) = When caliberda's Mac Island & Dock mod is active, attach the Cat Buddy and LLM notification directly to the top Dynamic Island bar instead of floating across the screen. Off = Standalone screen mode.
 - robotBuddyMode: true
-  $name: Anime Cat Buddy Icon Mode
-  $description: On (default) = Cute anime cat buddy pops up in the very middle for 2s (Orange for Claude, Black for Codex, Green for Gemini), then glides to the top-left for 30s (click to bring LLM to top). Off = Full bottom Spotlight glass bar.
+  $name: Anime Cat Buddy Display Mode
+  $description: On (default) = Cute anime cat buddy with branded avatars (Orange for Claude, Black for Codex, Green for Gemini).
 - autoDismissSeconds: 30
   $name: Auto-Dismiss Timeout (seconds)
-  $description: How long the Cat Buddy perches in the top-left before fading away (default 30 seconds).
+  $description: How long the Cat Buddy rests at the Island bar or perch before fading away (default 30 seconds).
 - openWindowMode: false
   $name: Open LLM Window on Click (Spotlight Bar Mode)
   $description: Off (default) = Read full summary/options on the HUD and reply inline without leaving your active window. On = Clicking the notification or an option opens and switches to the LLM window and chat.
@@ -111,6 +117,7 @@ enum ACCENT_STATE {
 };
 
 struct ModSettings {
+    bool macIslandIntegration = true;
     bool robotBuddyMode = true;
     int autoDismissSeconds = 30;
     bool openWindowMode = false;
@@ -401,6 +408,17 @@ struct HudChoreography {
     float customBuddyPerchX = 24.0f;
     float customBuddyPerchY = 24.0f;
 
+    // Mac Island & Dock (caliberda) dynamic attachment springs & state
+    bool islandModeActive = false;
+    Spring1D islandYSpring;
+    Spring1D islandScaleSpring;
+    Spring1D islandOpacitySpring;
+    Spring1D islandHoverSpring;
+    bool islandHovered = false;
+    float islandXPos = 0.0f;
+    RECT activeIslandRect = {};
+    HWND activeIslandHwnd = nullptr;
+
     Spring1D popoverProgress;
     Spring1D popoverAnchorX;
     std::wstring popoverHeading;
@@ -441,6 +459,10 @@ struct HudChoreography {
         contentFadeSpring.Reset(1.0f, 1.0f);
         popoverProgress.Reset(0.0f, 0.0f);
         popoverAnchorX.Reset(270.0f, 270.0f);
+        islandYSpring.Reset(0.0f, 0.0f);
+        islandScaleSpring.Reset(1.0f, 1.0f);
+        islandOpacitySpring.Reset(0.0f, 0.0f);
+        islandHoverSpring.Reset(0.0f, 0.0f);
     }
 
     bool IsWithinClickjackGraceWindow() const {
@@ -1301,11 +1323,266 @@ static void RenderRobotBuddyHud(HWND hwnd, const LLMCyclePayload& payload) {
     ReleaseDC(nullptr, hdcScreen);
 }
 
+// ============================================================================
+// caliberda's Mac Island & Dock (Dynamic Island) Integration
+// ============================================================================
+
+const int kIslandHudWidth = 380;
+const int kIslandHudHeight = 62;
+
+struct IslandInfo {
+    HWND hwnd = nullptr;
+    RECT rect = {};
+    HMONITOR hMonitor = nullptr;
+};
+
+static IslandInfo FindMacIslandForMonitor(HMONITOR hTargetMon) {
+    IslandInfo best = {};
+    struct EnumContext {
+        HMONITOR target;
+        IslandInfo* out;
+    } ctx = { hTargetMon, &best };
+
+    EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+        auto* c = reinterpret_cast<EnumContext*>(lParam);
+        if (!IsWindowVisible(hwnd)) return TRUE;
+        wchar_t cls[64] = {};
+        if (GetClassNameW(hwnd, cls, 64) > 0 && wcscmp(cls, L"WindhawkMacIslandDockIsland") == 0) {
+            RECT rc = {};
+            if (GetWindowRect(hwnd, &rc) && (rc.right - rc.left) > 100) {
+                POINT pt = { (rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2 };
+                HMONITOR mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+                if (mon == c->target || !c->out->hwnd) {
+                    c->out->hwnd = hwnd;
+                    c->out->rect = rc;
+                    c->out->hMonitor = mon;
+                    if (mon == c->target) return FALSE; // Exact monitor match found!
+                }
+            }
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&ctx));
+
+    return best;
+}
+
+static void RenderMacIslandHud(HWND hwnd, const LLMCyclePayload& payload, const RECT& islandRc, float screenX, float screenY) {
+    const int w = kIslandHudWidth;
+    const int h = kIslandHudHeight;
+
+    LONGLONG nowQpc = 0;
+    QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&nowQpc));
+    float elapsedSec = (g_anim.showQpc > 0 && g_anim.qpcFreq > 0)
+        ? static_cast<float>(nowQpc - g_anim.showQpc) / static_cast<float>(g_anim.qpcFreq)
+        : 0.0f;
+    float totalDuration = static_cast<float>(std::clamp(g_settings.autoDismissSeconds > 0 ? g_settings.autoDismissSeconds : 30, 5, 300));
+    float alphaScale = std::clamp(g_anim.islandOpacitySpring.value, 0.0f, 1.0f);
+    float s = std::clamp(g_anim.islandScaleSpring.value, 0.70f, 1.25f);
+    float hoverT = std::clamp(g_anim.islandHoverSpring.value, 0.0f, 1.0f);
+
+    LLMBrand brand = DetectLLMBrand(payload);
+    Color neonPrimary(255, 255, 142, 58); // Claude orange
+    std::wstring brandName = L"Claude Code";
+    if (brand == LLMBrand::Codex_Black) {
+        neonPrimary = Color(255, 255, 62, 84); // Codex crimson
+        brandName = L"OpenAI Codex";
+    } else if (brand == LLMBrand::Gemini_Green) {
+        neonPrimary = Color(255, 92, 235, 130); // Gemini green
+        brandName = StrStrIW(payload.sourceApp.c_str(), L"Antigravity") ? L"Antigravity" : L"Google Gemini";
+    }
+
+    HDC hdcScreen = GetDC(nullptr);
+    HDC hdcMem = CreateCompatibleDC(hdcScreen);
+
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void* pvBits = nullptr;
+    HBITMAP hbm = CreateDIBSection(hdcMem, &bmi, DIB_RGB_COLORS, &pvBits, nullptr, 0);
+    HBITMAP hbmOld = static_cast<HBITMAP>(SelectObject(hdcMem, hbm));
+
+    {
+        Graphics g(hdcMem);
+        g.SetSmoothingMode(SmoothingModeAntiAlias);
+        g.SetPixelOffsetMode(PixelOffsetModeHighQuality);
+        g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+
+        auto A = [alphaScale](int a) -> BYTE {
+            return static_cast<BYTE>(std::clamp(static_cast<int>(std::round(a * alphaScale)), 0, 255));
+        };
+
+        // Center transform for spring scale
+        float cx = w * 0.5f;
+        float cy = h * 0.5f;
+        g.TranslateTransform(cx, cy);
+        g.ScaleTransform(s, s);
+        g.TranslateTransform(-cx, -cy);
+
+        // 1. Apple Liquid Glass Capsule Base (Matches caliberda's Mac Island styling)
+        RectF capsuleRect(2.0f, 2.0f, static_cast<float>(w - 4), static_cast<float>(h - 4));
+        GraphicsPath capsulePath;
+        AddRoundRect(capsulePath, capsuleRect, 22.0f);
+
+        // Outer soft elevation shadow
+        for (int i = 3; i >= 1; --i) {
+            float exp = static_cast<float>(i * 1.5f);
+            RectF shadowRc(2.0f - exp, 2.0f - exp + 1.5f, static_cast<float>(w - 4) + exp * 2.0f, static_cast<float>(h - 4) + exp * 2.0f);
+            GraphicsPath sPath;
+            AddRoundRect(sPath, shadowRc, 22.0f + exp);
+            SolidBrush sBrush(Color(A(10 + (4 - i) * 6), 0, 0, 0));
+            g.FillPath(&sBrush, &sPath);
+        }
+
+        // Obsidian Glass Body Gradient
+        LinearGradientBrush glassFill(
+            PointF(0.0f, 0.0f),
+            PointF(0.0f, static_cast<float>(h)),
+            Color(A(std::min(240, g_settings.glassOpacity + 40)), 24, 28, 38),
+            Color(A(std::min(252, g_settings.glassOpacity + 60)), 10, 12, 18)
+        );
+        g.FillPath(&glassFill, &capsulePath);
+
+        // Specular top rim highlight
+        Pen rimPen(Color(A(hoverT > 0.1f ? 210 : 160), 255, 255, 255), hoverT > 0.1f ? 1.4f : 1.15f);
+        g.DrawPath(&rimPen, &capsulePath);
+
+        // Ambient brand glow behind the cat on the left
+        float glowX = 36.0f;
+        float glowY = 31.0f;
+        for (int ring = 3; ring >= 1; --ring) {
+            float gr = 18.0f + ring * 8.0f;
+            int gAlpha = (4 - ring) * (hoverT > 0.1f ? 18 : 12);
+            SolidBrush auraBrush(Color(A(gAlpha), neonPrimary.GetR(), neonPrimary.GetG(), neonPrimary.GetB()));
+            g.FillEllipse(&auraBrush, glowX - gr, glowY - gr, gr * 2.0f, gr * 2.0f);
+        }
+
+        // 2. The Branded Anime Cat Avatar Disc (Left)
+        float catDiscR = 21.0f;
+        float catCenterY = 31.0f + std::sin(elapsedSec * 3.6f) * 1.4f; // subtle breathing bob
+        LinearGradientBrush catDiscFill(
+            PointF(glowX, catCenterY - catDiscR),
+            PointF(glowX, catCenterY + catDiscR),
+            Color(A(140), 38, 44, 60),
+            Color(A(180), 16, 20, 28)
+        );
+        g.FillEllipse(&catDiscFill, glowX - catDiscR, catCenterY - catDiscR, catDiscR * 2.0f, catDiscR * 2.0f);
+        Pen catDiscRim(Color(A(130), 255, 255, 255), 1.0f);
+        g.DrawEllipse(&catDiscRim, glowX - catDiscR, catCenterY - catDiscR, catDiscR * 2.0f, catDiscR * 2.0f);
+
+        Bitmap* pCat = GetCatBitmapForBrand(brand);
+        if (pCat) {
+            g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+            float bw = static_cast<float>(pCat->GetWidth());
+            float bh = static_cast<float>(pCat->GetHeight());
+            float targetSize = 40.0f;
+            float aspect = (bh > 0.0f) ? (bw / bh) : 1.0f;
+            float dw = (aspect >= 1.0f) ? targetSize : targetSize * aspect;
+            float dh = (aspect >= 1.0f) ? (targetSize / aspect) : targetSize;
+            RectF catRc(glowX - dw * 0.5f, catCenterY - dh * 0.5f, dw, dh);
+            g.DrawImage(pCat, catRc, 0, 0, bw, bh, UnitPixel);
+        }
+
+        // 3. Middle Content: Brand Badge & Subtitle
+        FontFamily fontFamily(L"Segoe UI Variable Display");
+        FontFamily fallbackFamily(L"Segoe UI");
+        const FontFamily* fam = fontFamily.IsAvailable() ? &fontFamily : &fallbackFamily;
+        Font titleFont(fam, 12.0f, FontStyleBold, UnitPixel);
+        Font subFont(fam, 11.0f, FontStyleRegular, UnitPixel);
+
+        // Neon brand indicator dot
+        SolidBrush neonDotBrush(Color(A(245), neonPrimary.GetR(), neonPrimary.GetG(), neonPrimary.GetB()));
+        g.FillEllipse(&neonDotBrush, 68.0f, 17.0f, 6.0f, 6.0f);
+
+        // Display App title
+        std::wstring titleText = !payload.sourceApp.empty() ? payload.sourceApp : brandName;
+        SolidBrush titleBrush(Color(A(252), 246, 250, 255));
+        PointF titlePt(78.0f, 13.0f);
+        g.DrawString(titleText.c_str(), -1, &titleFont, titlePt, &titleBrush);
+
+        // Subtitle / Choices description
+        std::wstring subText;
+        if (!payload.options.empty()) {
+            subText = std::to_wstring(payload.options.size()) + L" Choices \x00B7 Click to focus chat";
+        } else if (!payload.summaryShort.empty() && payload.summaryShort != L"Ready for your next instruction or option selection.") {
+            subText = payload.summaryShort;
+        } else {
+            subText = L"Turn finished \x00B7 Click to open";
+        }
+        if (subText.size() > 36) {
+            subText = subText.substr(0, 35) + L"\x2026";
+        }
+        SolidBrush subBrush(Color(A(190), 195, 205, 222));
+        PointF subPt(68.0f, 33.0f);
+        g.DrawString(subText.c_str(), -1, &subFont, subPt, &subBrush);
+
+        // 4. Right Side: 30-Second Countdown Halo Ring
+        float ringCenterX = static_cast<float>(w - 32);
+        float ringCenterY = 31.0f;
+        float ringR = 12.5f;
+
+        // Dim track circle
+        Pen ringTrack(Color(A(45), 255, 255, 255), 2.2f);
+        g.DrawEllipse(&ringTrack, ringCenterX - ringR, ringCenterY - ringR, ringR * 2.0f, ringR * 2.0f);
+
+        // Active countdown arc
+        float remainFrac = 1.0f;
+        if (elapsedSec > 0.0f) {
+            remainFrac = std::clamp(1.0f - elapsedSec / totalDuration, 0.0f, 1.0f);
+        }
+        Pen arcPen(Color(A(235), neonPrimary.GetR(), neonPrimary.GetG(), neonPrimary.GetB()), 2.4f);
+        arcPen.SetStartCap(LineCapRound);
+        arcPen.SetEndCap(LineCapRound);
+        g.DrawArc(&arcPen, ringCenterX - ringR, ringCenterY - ringR, ringR * 2.0f, ringR * 2.0f, -90.0f, remainFrac * 360.0f);
+
+        // Center glyph: right arrow on hover or small dot when resting
+        if (hoverT > 0.2f) {
+            Font arrowFont(fam, 10.0f, FontStyleBold, UnitPixel);
+            StringFormat centerFmt;
+            centerFmt.SetAlignment(StringAlignmentCenter);
+            centerFmt.SetLineAlignment(StringAlignmentCenter);
+            RectF arrowRc(ringCenterX - 10.0f, ringCenterY - 10.0f, 20.0f, 20.0f);
+            SolidBrush arrowBrush(Color(A(245), 255, 255, 255));
+            g.DrawString(L"\x2192", -1, &arrowFont, arrowRc, &centerFmt, &arrowBrush);
+        } else {
+            SolidBrush centerDot(Color(A(150), neonPrimary.GetR(), neonPrimary.GetG(), neonPrimary.GetB()));
+            g.FillEllipse(&centerDot, ringCenterX - 2.5f, ringCenterY - 2.5f, 5.0f, 5.0f);
+        }
+    }
+
+    int px = static_cast<int>(std::round(screenX));
+    int py = static_cast<int>(std::round(screenY));
+
+    POINT ptSrc = {0, 0};
+    POINT ptDst = {px, py};
+    SIZE wndSize = {w, h};
+    BLENDFUNCTION blend = {};
+    blend.BlendOp = AC_SRC_OVER;
+    blend.SourceConstantAlpha = 255;
+    blend.AlphaFormat = AC_SRC_ALPHA;
+
+    UpdateLayeredWindow(hwnd, hdcScreen, &ptDst, &wndSize, hdcMem, &ptSrc, 0, &blend, ULW_ALPHA);
+
+    SelectObject(hdcMem, hbmOld);
+    DeleteObject(hbm);
+    DeleteDC(hdcMem);
+    ReleaseDC(nullptr, hdcScreen);
+}
+
 static void RenderGlassHud(HWND hwnd) {
     LLMCyclePayload payload;
     {
         std::lock_guard<std::mutex> lock(g_payloadMutex);
         payload = g_currentPayload;
+    }
+
+    if (g_settings.macIslandIntegration && g_anim.islandModeActive) {
+        RenderMacIslandHud(hwnd, payload, g_anim.activeIslandRect, g_anim.islandXPos, g_anim.islandYSpring.value);
+        return;
     }
 
     if (g_settings.robotBuddyMode) {
@@ -1750,6 +2027,16 @@ static void StartDismissAnimation(HWND hwnd, float releaseVelocityY = 0.0f) {
     g_anim.popoverActive = false;
     g_anim.popoverProgress.target = 0.0f;
 
+    if (g_settings.macIslandIntegration && g_anim.islandModeActive) {
+        g_anim.islandOpacitySpring.target = 0.0f;
+        g_anim.islandScaleSpring.target = 0.92f;
+        if (g_anim.activeIslandRect.top != 0 || g_anim.activeIslandRect.bottom != 0) {
+            g_anim.islandYSpring.target = static_cast<float>(g_anim.activeIslandRect.top - 10);
+        }
+        EnsureAnimationLoopRunning(hwnd);
+        return;
+    }
+
     if (g_settings.robotBuddyMode) {
         g_anim.buddyOpacitySpring.target = 0.0f;
         g_anim.buddyScaleSpring.target = IsReducedMotionEnabled() ? 0.96f : 0.86f;
@@ -1779,6 +2066,36 @@ static void StepSpringAnimation(HWND hwnd) {
     float dt = static_cast<float>(now - g_anim.lastFrameQpc) / static_cast<float>(g_anim.qpcFreq);
     g_anim.lastFrameQpc = now;
     dt = std::clamp(dt, 0.001f, 0.033f);
+
+    if (g_settings.macIslandIntegration && g_anim.islandModeActive) {
+        float restY = static_cast<float>(g_anim.activeIslandRect.bottom + 5);
+        if (!g_anim.dismissing) {
+            g_anim.islandYSpring.target = restY;
+            g_anim.islandScaleSpring.target = g_anim.islandHovered ? 1.028f : 1.0f;
+            g_anim.islandOpacitySpring.target = 1.0f;
+        } else {
+            g_anim.islandYSpring.target = static_cast<float>(g_anim.activeIslandRect.top - 10);
+            g_anim.islandScaleSpring.target = 0.92f;
+            g_anim.islandOpacitySpring.target = 0.0f;
+        }
+
+        bool yMoving = g_anim.islandYSpring.Step(dt, 26.0f, 0.82f);
+        bool sMoving = g_anim.islandScaleSpring.Step(dt, 32.0f, 0.88f);
+        bool opMoving = g_anim.islandOpacitySpring.Step(dt, 24.0f, 1.0f);
+        g_anim.islandHoverSpring.Step(dt, 28.0f, 1.0f);
+
+        RenderGlassHud(hwnd);
+
+        if (g_anim.dismissing && !opMoving && g_anim.islandOpacitySpring.value <= 0.01f) {
+            KillTimer(hwnd, TIMER_SPRING_FRAME);
+            g_anim.lastFrameQpc = 0;
+            g_anim.visible = false;
+            g_anim.dismissing = false;
+            g_anim.islandModeActive = false;
+            ShowWindow(hwnd, SW_HIDE);
+        }
+        return;
+    }
 
     if (g_settings.robotBuddyMode) {
         float elapsedSec = (g_anim.showQpc > 0 && g_anim.qpcFreq > 0)
@@ -1939,42 +2256,66 @@ static LRESULT CALLBACK GlassHudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 }
             }
 
-            float monW = static_cast<float>(monRc.right - monRc.left);
-            float monH = static_cast<float>(monRc.bottom - monRc.top);
-            g_anim.buddyCenterX = static_cast<float>(monRc.left) + (monW - kBuddyCanvasSize) * 0.5f;
-            g_anim.buddyCenterY = static_cast<float>(monRc.top) + (monH - kBuddyCanvasSize) * 0.5f;
-            if (g_anim.hasCustomBuddyPerch) {
-                g_anim.buddyCornerX = g_anim.customBuddyPerchX;
-                g_anim.buddyCornerY = g_anim.customBuddyPerchY;
-            } else {
-                g_anim.buddyCornerX = static_cast<float>(monRc.left) + 24.0f;
-                g_anim.buddyCornerY = static_cast<float>(monRc.top) + 24.0f;
+            IslandInfo island = {};
+            if (g_settings.macIslandIntegration) {
+                island = FindMacIslandForMonitor(hMon);
             }
 
-            g_anim.buddyXSpring.Reset(g_anim.buddyCenterX, g_anim.buddyCenterX, 0.0f);
-            g_anim.buddyYSpring.Reset(g_anim.buddyCenterY, g_anim.buddyCenterY, 0.0f);
-            g_anim.buddyScaleSpring.Reset(reduced ? 1.0f : 0.82f, reduced ? 1.0f : 1.06f, reduced ? 0.0f : 3.8f);
-            g_anim.buddyOpacitySpring.Reset(0.0f, 1.0f, 0.0f);
-            g_anim.buddyBlurSpring.Reset(reduced ? 0.0f : 8.0f, 0.0f, 0.0f);
-            g_anim.buddyTiltSpring.Reset(0.0f, 0.0f, 0.0f);
-            g_anim.buddyHoverSpring.Reset(0.0f, 0.0f, 0.0f);
-            g_anim.buddyShakeX = 0.0f;
-            g_anim.buddyHopY = 0.0f;
-            g_anim.buddyLaunchedToCorner = false;
-            g_anim.buddyHovered = false;
+            if (g_settings.macIslandIntegration && island.hwnd) {
+                g_anim.islandModeActive = true;
+                g_anim.activeIslandRect = island.rect;
+                g_anim.activeIslandHwnd = island.hwnd;
 
-            if (!g_anim.visible) {
-                g_anim.ySpring.Reset(reduced ? 0.0f : 56.0f, 0.0f, 0.0f);
-                g_anim.scaleSpring.Reset(reduced ? 1.0f : 0.96f, 1.0f, 0.0f);
-                g_anim.opacitySpring.Reset(0.0f, 1.0f, 0.0f);
-                g_anim.heightSpring.Reset(targetH, targetH, 0.0f);
-                g_anim.contentFadeSpring.Reset(1.0f, 1.0f, 0.0f);
+                float hudW = static_cast<float>(kIslandHudWidth);
+                float islandCenter = static_cast<float>(island.rect.left + island.rect.right) * 0.5f;
+                g_anim.islandXPos = islandCenter - hudW * 0.5f;
+
+                float startY = static_cast<float>(island.rect.top);
+                float restY = static_cast<float>(island.rect.bottom + 5);
+                g_anim.islandYSpring.Reset(reduced ? restY : startY, restY, reduced ? 0.0f : 140.0f);
+                g_anim.islandScaleSpring.Reset(reduced ? 1.0f : 0.94f, 1.0f, 0.0f);
+                g_anim.islandOpacitySpring.Reset(0.0f, 1.0f, 0.0f);
+                g_anim.islandHoverSpring.Reset(0.0f, 0.0f, 0.0f);
+                g_anim.islandHovered = false;
             } else {
-                g_anim.ySpring.target = 0.0f;
-                g_anim.scaleSpring.target = 1.0f;
-                g_anim.opacitySpring.target = 1.0f;
-                g_anim.heightSpring.target = targetH;
-                g_anim.contentFadeSpring.Reset(0.75f, 1.0f, 0.0f);
+                g_anim.islandModeActive = false;
+                float monW = static_cast<float>(monRc.right - monRc.left);
+                float monH = static_cast<float>(monRc.bottom - monRc.top);
+                g_anim.buddyCenterX = static_cast<float>(monRc.left) + (monW - kBuddyCanvasSize) * 0.5f;
+                g_anim.buddyCenterY = static_cast<float>(monRc.top) + (monH - kBuddyCanvasSize) * 0.5f;
+                if (g_anim.hasCustomBuddyPerch) {
+                    g_anim.buddyCornerX = g_anim.customBuddyPerchX;
+                    g_anim.buddyCornerY = g_anim.customBuddyPerchY;
+                } else {
+                    g_anim.buddyCornerX = static_cast<float>(monRc.left) + 24.0f;
+                    g_anim.buddyCornerY = static_cast<float>(monRc.top) + 24.0f;
+                }
+
+                g_anim.buddyXSpring.Reset(g_anim.buddyCenterX, g_anim.buddyCenterX, 0.0f);
+                g_anim.buddyYSpring.Reset(g_anim.buddyCenterY, g_anim.buddyCenterY, 0.0f);
+                g_anim.buddyScaleSpring.Reset(reduced ? 1.0f : 0.82f, reduced ? 1.0f : 1.06f, reduced ? 0.0f : 3.8f);
+                g_anim.buddyOpacitySpring.Reset(0.0f, 1.0f, 0.0f);
+                g_anim.buddyBlurSpring.Reset(reduced ? 0.0f : 8.0f, 0.0f, 0.0f);
+                g_anim.buddyTiltSpring.Reset(0.0f, 0.0f, 0.0f);
+                g_anim.buddyHoverSpring.Reset(0.0f, 0.0f, 0.0f);
+                g_anim.buddyShakeX = 0.0f;
+                g_anim.buddyHopY = 0.0f;
+                g_anim.buddyLaunchedToCorner = false;
+                g_anim.buddyHovered = false;
+
+                if (!g_anim.visible) {
+                    g_anim.ySpring.Reset(reduced ? 0.0f : 56.0f, 0.0f, 0.0f);
+                    g_anim.scaleSpring.Reset(reduced ? 1.0f : 0.96f, 1.0f, 0.0f);
+                    g_anim.opacitySpring.Reset(0.0f, 1.0f, 0.0f);
+                    g_anim.heightSpring.Reset(targetH, targetH, 0.0f);
+                    g_anim.contentFadeSpring.Reset(1.0f, 1.0f, 0.0f);
+                } else {
+                    g_anim.ySpring.target = 0.0f;
+                    g_anim.scaleSpring.target = 1.0f;
+                    g_anim.opacitySpring.target = 1.0f;
+                    g_anim.heightSpring.target = targetH;
+                    g_anim.contentFadeSpring.Reset(0.75f, 1.0f, 0.0f);
+                }
             }
 
             QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&g_anim.showQpc));
@@ -2052,10 +2393,22 @@ static LRESULT CALLBACK GlassHudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         case WM_MOUSEACTIVATE:
             return MA_NOACTIVATE;
 
+        case WM_SETCURSOR: {
+            if (g_settings.macIslandIntegration && g_anim.islandModeActive && g_anim.islandHovered) {
+                SetCursor(LoadCursor(nullptr, IDC_HAND));
+                return TRUE;
+            }
+            break;
+        }
+
         case WM_LBUTTONDOWN: {
             if (g_anim.isDragging || g_anim.IsWithinClickjackGraceWindow()) return 0;
             int x = GET_X_LPARAM(lParam);
             int y = GET_Y_LPARAM(lParam);
+
+            if (g_settings.macIslandIntegration && g_anim.islandModeActive) {
+                return 0;
+            }
 
             if (g_settings.robotBuddyMode) {
                 SetCapture(hwnd);
@@ -2109,6 +2462,18 @@ static LRESULT CALLBACK GlassHudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         case WM_MOUSEMOVE: {
             int x = GET_X_LPARAM(lParam);
             int y = GET_Y_LPARAM(lParam);
+
+            if (g_settings.macIslandIntegration && g_anim.islandModeActive) {
+                if (!g_anim.islandHovered) {
+                    g_anim.islandHovered = true;
+                    g_anim.islandHoverSpring.target = 1.0f;
+                    SetCursor(LoadCursor(nullptr, IDC_HAND));
+                    EnsureAnimationLoopRunning(hwnd);
+                }
+                TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, hwnd, 0};
+                TrackMouseEvent(&tme);
+                return 0;
+            }
 
             if (g_settings.robotBuddyMode) {
                 if (g_anim.isDragging) {
@@ -2209,6 +2574,14 @@ static LRESULT CALLBACK GlassHudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         }
 
         case WM_MOUSELEAVE: {
+            if (g_settings.macIslandIntegration && g_anim.islandModeActive) {
+                if (g_anim.islandHovered) {
+                    g_anim.islandHovered = false;
+                    g_anim.islandHoverSpring.target = 0.0f;
+                    EnsureAnimationLoopRunning(hwnd);
+                }
+                return 0;
+            }
             if (g_settings.robotBuddyMode) {
                 if (g_anim.buddyHovered) {
                     g_anim.buddyHovered = false;
@@ -2236,6 +2609,13 @@ static LRESULT CALLBACK GlassHudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         case WM_LBUTTONUP: {
             int x = GET_X_LPARAM(lParam);
             int y = GET_Y_LPARAM(lParam);
+
+            if (g_settings.macIslandIntegration && g_anim.islandModeActive) {
+                g_anim.islandScaleSpring.velocity = 3.5f;
+                SendAnswerToLLM(L"", true);
+                StartDismissAnimation(hwnd);
+                return 0;
+            }
 
             if (g_settings.robotBuddyMode) {
                 if (g_anim.isDragging) {
@@ -2335,6 +2715,10 @@ static LRESULT CALLBACK GlassHudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         }
 
         case WM_RBUTTONUP: {
+            if (g_settings.macIslandIntegration && g_anim.islandModeActive) {
+                StartDismissAnimation(hwnd);
+                return 0;
+            }
             if (g_settings.robotBuddyMode) {
                 StartDismissAnimation(hwnd);
                 return 0;
@@ -2425,23 +2809,31 @@ static DWORD WINAPI HudHostThreadProc(LPVOID) {
 
     // Automatically launch the background multi-agent transcript watcher (Antigravity, Claude Code, Codex)
     {
-        wchar_t userProfile[MAX_PATH] = {};
-        if (GetEnvironmentVariableW(L"USERPROFILE", userProfile, MAX_PATH) > 0) {
-            std::wstring scriptPath = std::wstring(userProfile) +
-                L"\\.gemini\\antigravity\\scratch\\windhawk-llm-glass-hud\\tools\\agy_stop_hook.py";
-            if (GetFileAttributesW(scriptPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                std::wstring cmdLine = L"pythonw.exe \"" + scriptPath + L"\" --watch";
-                STARTUPINFOW si = {};
-                si.cb = sizeof(si);
-                si.dwFlags = STARTF_USESHOWWINDOW;
-                si.wShowWindow = SW_HIDE;
-                PROCESS_INFORMATION pi = {};
-                std::vector<wchar_t> mutableCmd(cmdLine.begin(), cmdLine.end());
-                mutableCmd.push_back(L'\0');
-                if (CreateProcessW(nullptr, mutableCmd.data(), nullptr, nullptr, FALSE,
-                                   CREATE_NO_WINDOW | DETACHED_PROCESS, nullptr, nullptr, &si, &pi)) {
-                    CloseHandle(pi.hThread);
-                    CloseHandle(pi.hProcess);
+        HANDLE hCheckMutex = OpenMutexW(SYNCHRONIZE, FALSE, L"Global\\WindhawkLLMHudWatcherMutex");
+        if (!hCheckMutex) {
+            hCheckMutex = OpenMutexW(SYNCHRONIZE, FALSE, L"Local\\WindhawkLLMHudWatcherMutex");
+        }
+        if (hCheckMutex) {
+            CloseHandle(hCheckMutex);
+        } else {
+            wchar_t userProfile[MAX_PATH] = {};
+            if (GetEnvironmentVariableW(L"USERPROFILE", userProfile, MAX_PATH) > 0) {
+                std::wstring scriptPath = std::wstring(userProfile) +
+                    L"\\.gemini\\antigravity\\scratch\\windhawk-llm-glass-hud\\tools\\agy_stop_hook.py";
+                if (GetFileAttributesW(scriptPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                    std::wstring cmdLine = L"pythonw.exe \"" + scriptPath + L"\" --watch";
+                    STARTUPINFOW si = {};
+                    si.cb = sizeof(si);
+                    si.dwFlags = STARTF_USESHOWWINDOW;
+                    si.wShowWindow = SW_HIDE;
+                    PROCESS_INFORMATION pi = {};
+                    std::vector<wchar_t> mutableCmd(cmdLine.begin(), cmdLine.end());
+                    mutableCmd.push_back(L'\0');
+                    if (CreateProcessW(nullptr, mutableCmd.data(), nullptr, nullptr, FALSE,
+                                       CREATE_NO_WINDOW | DETACHED_PROCESS, nullptr, nullptr, &si, &pi)) {
+                        CloseHandle(pi.hThread);
+                        CloseHandle(pi.hProcess);
+                    }
                 }
             }
         }
@@ -2615,6 +3007,7 @@ BOOL WINAPI Hooked_FlashWindowEx(PFLASHWINFO pfwi) {
 }
 
 static void LoadSettings() {
+    g_settings.macIslandIntegration = Wh_GetIntSetting(L"macIslandIntegration") != 0;
     g_settings.robotBuddyMode = Wh_GetIntSetting(L"robotBuddyMode") != 0;
     g_settings.autoDismissSeconds = Wh_GetIntSetting(L"autoDismissSeconds");
     g_settings.openWindowMode = Wh_GetIntSetting(L"openWindowMode") != 0;

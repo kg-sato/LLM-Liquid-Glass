@@ -546,6 +546,13 @@ def read_last_response_from_candidates(payload: dict) -> tuple[str, str, list[st
 
 def ensure_watcher_running() -> None:
     """Spawns the background multi-agent transcript watcher if not already running."""
+    k32 = ctypes.windll.kernel32
+    # Check system-wide named mutex first: only one watcher daemon can ever run
+    h_check = k32.OpenMutexW(0x00100000, False, "Global\\WindhawkLLMHudWatcherMutex")  # SYNCHRONIZE
+    if h_check:
+        k32.CloseHandle(h_check)
+        return
+
     lock_file = os.path.join(os.environ.get("TEMP", "."), "windhawk_llm_hud_watcher.lock")
     try:
         if os.path.isfile(lock_file):
@@ -568,6 +575,12 @@ def ensure_watcher_running() -> None:
 
 
 def run_watcher_daemon() -> int:
+    k32 = ctypes.windll.kernel32
+    # Enforce single system-wide watcher instance via Windows Named Mutex
+    h_mutex = k32.CreateMutexW(None, True, "Global\\WindhawkLLMHudWatcherMutex")
+    if not h_mutex or k32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        return 0
+
     lock_file = os.path.join(os.environ.get("TEMP", "."), "windhawk_llm_hud_watcher.lock")
     home = os.path.expanduser("~")
     file_offsets: dict[str, int] = {}
@@ -608,12 +621,12 @@ def run_watcher_daemon() -> int:
             ),
         ]
 
-    # Initialize offsets to current end-of-file so we only trigger on NEW completed cycles
+    # Initialize offsets to current end-of-file for all recent logs (past 3 days)
     now = time.time()
     for _app, paths, _exes, _kws in gather_sources():
         for path in paths:
             try:
-                if now - os.path.getmtime(path) < 86400:
+                if now - os.path.getmtime(path) < 86400 * 3:
                     file_offsets[path] = os.path.getsize(path)
             except Exception:
                 pass
@@ -630,11 +643,14 @@ def run_watcher_daemon() -> int:
             for path in paths:
                 try:
                     mtime = os.path.getmtime(path)
-                    if now - mtime > 3600:
+                    # Monitor logs from the past 3 days (prevent dropping after 1 hour)
+                    if now - mtime > 86400 * 3:
                         continue
                     size = os.path.getsize(path)
+                    # When a log file is newly discovered, tail from current EOF
                     if path not in file_offsets:
-                        file_offsets[path] = 0
+                        file_offsets[path] = size
+                        continue
                     if size <= file_offsets[path]:
                         continue
 
@@ -695,7 +711,7 @@ def run_watcher_daemon() -> int:
                                 )
                             )
 
-                            sig = f"{display_app}|{host_session_id}|{title}|{summary}|{';'.join(final_opts)}"
+                            sig = f"{display_app}|{host_session_id}|{title}|{summary}|{path}:{file_offsets[path]}"
                             if sig != last_dispatched_sig:
                                 last_dispatched_sig = sig
                                 badge = (
